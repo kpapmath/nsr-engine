@@ -7,6 +7,9 @@ from typing import Any
 import pandas as pd
 
 
+_MAXIMIZE_METRICS = {"r2", "adjusted_r2"}
+
+
 @dataclass
 class ParetoPoint:
     equation: str
@@ -23,6 +26,8 @@ class ParetoPoint:
         callers. When ``score_metric`` is not ``"mse"``, it contains that
         metric's value.
         """
+        if self.score_metric in _MAXIMIZE_METRICS:
+            return -self.mse
         return self.mse
 
 
@@ -77,7 +82,7 @@ class ParetoFront:
         metric = self.points[0].score_metric if self.points else "mse"
         return pd.DataFrame(
             [
-                {"equation": p.equation, "complexity": p.complexity, metric: p.score}
+                {"equation": p.equation, "complexity": p.complexity, metric: p.mse}
                 for p in sorted(self.points, key=lambda p: p.complexity)
             ]
         )

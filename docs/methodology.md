@@ -130,11 +130,19 @@ y_hat = b0 + b1 * expression
 The affine wrapper is fit by least squares. The residuals from that calibrated
 expression are then scored with `score_metric`. Supported metrics are:
 
-| `score_metric` | Meaning |
-| --- | --- |
-| `"mse"` | Mean squared error. |
-| `"rmse"` | Root mean squared error. |
-| `"mae"` | Mean absolute error. |
+| `score_metric` | Meaning | Direction |
+| --- | --- | --- |
+| `"mse"` | `mean(residual^2)` | Lower is better. |
+| `"rmse"` | `sqrt(mean(residual^2))` | Lower is better. |
+| `"mae"` | `mean(abs(residual))` | Lower is better. |
+| `"mape"` | `100 * mean(abs(residual) / max(abs(y), eps))` | Lower is better. |
+| `"mbd"` | `abs(mean(prediction - y))` | Lower is better. |
+| `"r2"` | `1 - SSE / SST` | Higher is better. |
+| `"adjusted_r2"` | `1 - (1 - r2) * (n - 1) / (n - p - 1)`, with `p=1` for the generated expression | Higher is better. |
+
+For constant targets, R squared returns `1.0` for a perfect fit and `0.0`
+otherwise. For MAPE, `eps` is a small denominator guard for zero-valued
+targets.
 
 This makes the reward less sensitive to scale and offset, so a structurally
 useful expression can be discovered even if it needs linear calibration.
@@ -151,9 +159,13 @@ flowchart TD
 The reward used during training is:
 
 ```text
-normalized_score = score / target_scale
+normalized_score = score_loss / target_scale
 reward = 1 / (1 + normalized_score) - lambda * complexity
 ```
+
+For lower-is-better metrics, `score_loss` is the metric value. For `"r2"` and
+`"adjusted_r2"`, `score_loss = max(1 - metric_value, 0)` so the reward remains
+a minimization-style loss while the reported metric stays an R squared value.
 
 If `affine_reward=False`, the engine scores the raw expression directly with
 the selected metric. The default `score_metric` is `"mse"` to preserve the
@@ -242,7 +254,7 @@ Each surviving expression has two objectives:
 | Objective | Direction |
 | --- | --- |
 | `complexity` | Lower is better. |
-| selected score metric | Lower is better. |
+| selected score metric | Lower is better, except `"r2"` and `"adjusted_r2"` where higher is better. |
 
 Point A dominates point B when A is no worse in both objectives and strictly
 better in at least one. The final front keeps only non-dominated points.

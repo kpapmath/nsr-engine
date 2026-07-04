@@ -75,7 +75,16 @@ _CONST_TOKENS: tuple[str, ...] = ("-1.0", "-0.5", "0.5", "1.0", "2.0")
 _CONST_VALUES: dict[str, float] = {t: float(t) for t in _CONST_TOKENS}
 
 _START_TOKEN = "<s>"  # sentinel fed at step 0
-_SCORE_METRICS: tuple[str, ...] = ("mse", "rmse", "mae")
+_SCORE_METRICS: tuple[str, ...] = (
+    "mse",
+    "rmse",
+    "mae",
+    "mape",
+    "mbd",
+    "r2",
+    "adjusted_r2",
+)
+_METRIC_EPS = 1e-10
 
 
 def _get_arity(
@@ -210,7 +219,13 @@ def _affine_residual(
     return resid_sse / n, b0, b1
 
 
-def _metric_from_residuals(resid: np.ndarray, metric: str) -> float:
+def _metric_from_residuals(
+    resid: np.ndarray,
+    metric: str,
+    *,
+    y: np.ndarray | None = None,
+    n_params: int = 1,
+) -> float:
     resid = np.asarray(resid, dtype=np.float64)
     if metric == "mse":
         return float(np.mean(resid * resid))
@@ -218,7 +233,50 @@ def _metric_from_residuals(resid: np.ndarray, metric: str) -> float:
         return float(math.sqrt(float(np.mean(resid * resid))))
     if metric == "mae":
         return float(np.mean(np.abs(resid)))
+    if metric == "mbd":
+        return float(abs(np.mean(-resid)))
+
+    if y is None:
+        raise ValueError(f"{metric} requires target values")
+    y = np.asarray(y, dtype=np.float64)
+    if metric == "mape":
+        denom = np.maximum(np.abs(y), _METRIC_EPS)
+        return float(np.mean(np.abs(resid) / denom) * 100.0)
+    if metric in {"r2", "adjusted_r2"}:
+        n = int(y.size)
+        if n == 0:
+            return float("nan")
+        centered = y - float(np.mean(y))
+        ss_tot = float(np.dot(centered, centered))
+        return _r2_from_sse(
+            float(np.dot(resid, resid)), ss_tot, n, metric, n_params=n_params
+        )
     raise ValueError(f"unsupported score_metric={metric!r}")
+
+
+def _metric_to_loss(value: float, metric: str) -> float:
+    if metric in {"r2", "adjusted_r2"}:
+        return max(1.0 - value, 0.0)
+    return value
+
+
+def _r2_from_sse(
+    sse: float,
+    ss_tot: float,
+    n: int,
+    metric: str,
+    *,
+    n_params: int = 1,
+) -> float:
+    if ss_tot <= _METRIC_EPS:
+        return 1.0 if sse <= _METRIC_EPS else 0.0
+    r2 = 1.0 - sse / ss_tot
+    if metric == "r2":
+        return float(r2)
+    denom = n - n_params - 1
+    if denom <= 0:
+        return float(r2)
+    return float(1.0 - (1.0 - r2) * (n - 1) / denom)
 
 
 def _target_metric_scale(y: np.ndarray, metric: str) -> float:
@@ -232,9 +290,15 @@ def _target_metric_scale(y: np.ndarray, metric: str) -> float:
         scale = float(math.sqrt(float(np.mean(centered * centered))))
     elif metric == "mae":
         scale = float(np.mean(np.abs(centered)))
+    elif metric == "mape":
+        scale = 100.0
+    elif metric == "mbd":
+        scale = float(np.mean(np.abs(centered)))
+    elif metric in {"r2", "adjusted_r2"}:
+        scale = 1.0
     else:
         raise ValueError(f"unsupported score_metric={metric!r}")
-    return max(scale, 1e-10)
+    return max(scale, _METRIC_EPS)
 
 
 # ---------------------------------------------------------------------------
@@ -571,8 +635,9 @@ class NSREngine:
         Directory for caching discovered candidates (JSON per lambda).
         If ``None``, no cache is written.
     score_metric:
-        Accuracy metric to minimize. Supported values are ``"mse"``,
-        ``"rmse"``, and ``"mae"``.
+        Accuracy metric. Supported values are ``"mse"``, ``"rmse"``,
+        ``"mae"``, ``"mape"``, ``"mbd"``, ``"r2"``, and
+        ``"adjusted_r2"``.
     prefilter_per_complexity:
         How many lowest-approx-score candidates per complexity level survive to
         the exact scoring + sympy-conversion stage.
@@ -734,7 +799,7 @@ class NSREngine:
             )
         else:
             resid = np.asarray(y, dtype=np.float64) - np.asarray(pred, dtype=np.float64)
-        return _metric_from_residuals(resid, self.score_metric)
+        return _metric_from_residuals(resid, self.score_metric, y=y, n_params=1)
 
     @staticmethod
     def _warn_negative_columns(X: pd.DataFrame) -> None:
@@ -974,13 +1039,14 @@ class NSREngine:
                     if valid_mask.sum() >= 2:
                         score_val = self._score(pred[valid_mask], step_y[valid_mask])
                         if score_val is not None:
-                            normalized_score = score_val / step_score_scale
+                            score_loss = _metric_to_loss(score_val, self.score_metric)
+                            normalized_score = score_loss / step_score_scale
                             r = 1.0 / (1.0 + normalized_score) - lam * len(tokens)
-                            if key not in discovered or score_val < discovered[key].approx_mse:
+                            if key not in discovered or score_loss < discovered[key].approx_mse:
                                 discovered[key] = _OOCExpr(
                                     tokens=key,
                                     complexity=len(tokens),
-                                    approx_mse=score_val,
+                                    approx_mse=score_loss,
                                 )
                 iter_rewards[key] = r
                 rewards.append(r)
@@ -1057,10 +1123,28 @@ class NSREngine:
                     resid = np.asarray(ym, dtype=np.float64) - (
                         b0 + b1 * np.asarray(pm, dtype=np.float64)
                     )
-                    out.append((cand, _metric_from_residuals(resid, self.score_metric), b0, b1))
+                    out.append(
+                        (
+                            cand,
+                            _metric_from_residuals(
+                                resid, self.score_metric, y=ym, n_params=1
+                            ),
+                            b0,
+                            b1,
+                        )
+                    )
             else:
                 resid = np.asarray(ym, dtype=np.float64) - np.asarray(pm, dtype=np.float64)
-                out.append((cand, _metric_from_residuals(resid, self.score_metric), 0.0, 1.0))
+                out.append(
+                    (
+                        cand,
+                        _metric_from_residuals(
+                            resid, self.score_metric, y=ym, n_params=1
+                        ),
+                        0.0,
+                        1.0,
+                    )
+                )
         return out
 
     def _exact_score_streaming(
@@ -1120,25 +1204,49 @@ class NSREngine:
             cov = spy[k] - sp_[k] * sy[k] / n
             syy_c = syy[k] - sy[k] * sy[k] / n
             if not self.affine_reward:
+                resid_sum = sy[k] - sp_[k]
                 mse = max((syy[k] - 2.0 * spy[k] + spp[k]) / n, 0.0)
-                score = math.sqrt(mse) if self.score_metric == "rmse" else mse
+                if self.score_metric == "rmse":
+                    score = math.sqrt(mse)
+                elif self.score_metric == "mbd":
+                    score = abs(-resid_sum / n)
+                elif self.score_metric in {"r2", "adjusted_r2"}:
+                    score = _r2_from_sse(mse * n, syy_c, n, self.score_metric)
+                else:
+                    score = mse
                 out.append((cand, score, 0.0, 1.0))
             elif var_p < 1e-18:
+                resid_sum = sy[k] - n * mean_y
                 mse = max(syy_c, 0.0) / n
-                score = math.sqrt(mse) if self.score_metric == "rmse" else mse
+                if self.score_metric == "rmse":
+                    score = math.sqrt(mse)
+                elif self.score_metric == "mbd":
+                    score = abs(-resid_sum / n)
+                elif self.score_metric in {"r2", "adjusted_r2"}:
+                    score = _r2_from_sse(mse * n, syy_c, n, self.score_metric)
+                else:
+                    score = mse
                 out.append((cand, score, mean_y, 0.0))
             else:
                 b1 = cov / var_p
                 b0 = mean_y - b1 * mean_p
+                resid_sum = sy[k] - (n * b0 + b1 * sp_[k])
                 mse = max(syy_c - cov * cov / var_p, 0.0) / n
-                score = math.sqrt(mse) if self.score_metric == "rmse" else mse
+                if self.score_metric == "rmse":
+                    score = math.sqrt(mse)
+                elif self.score_metric == "mbd":
+                    score = abs(-resid_sum / n)
+                elif self.score_metric in {"r2", "adjusted_r2"}:
+                    score = _r2_from_sse(mse * n, syy_c, n, self.score_metric)
+                else:
+                    score = mse
                 out.append((cand, score, b0, b1))
 
-        if self.score_metric != "mae":
+        if self.score_metric not in {"mae", "mape"}:
             return out
 
-        abs_sum = np.zeros(k_n)
-        hb = Heartbeat("nsr-exact-mae-pass2", interval_s=20.0)
+        metric_sum = np.zeros(k_n)
+        hb = Heartbeat(f"nsr-exact-{self.score_metric}-pass2", interval_s=20.0)
         params = [(b0, b1) for _, _, b0, b1 in out]
         ranges = chunk_ranges(lo, hi, chunk_rows)
         for ci, (start, stop) in enumerate(ranges):
@@ -1159,11 +1267,17 @@ class NSREngine:
                 resid = np.asarray(y[mask], dtype=np.float64) - (
                     b0 + b1 * np.asarray(pred[mask], dtype=np.float64)
                 )
-                abs_sum[k] += float(np.abs(resid).sum())
+                if self.score_metric == "mae":
+                    metric_sum[k] += float(np.abs(resid).sum())
+                else:
+                    denom = np.maximum(
+                        np.abs(np.asarray(y[mask], dtype=np.float64)), _METRIC_EPS
+                    )
+                    metric_sum[k] += float((np.abs(resid) / denom).sum() * 100.0)
             hb.beat(f"chunk {ci + 1}/{len(ranges)}  rows<= {stop:,}", force=(ci == 0))
 
         return [
-            (cand, abs_sum[k] / int(cnt[k]) if int(cnt[k]) >= 2 else float("nan"), b0, b1)
+            (cand, metric_sum[k] / int(cnt[k]) if int(cnt[k]) >= 2 else float("nan"), b0, b1)
             for k, (cand, _, b0, b1) in enumerate(out)
         ]
 
@@ -1180,14 +1294,15 @@ class NSREngine:
             if converted is None:
                 continue
             eq_str, sympy_expr = converted
-            if eq_str not in by_equation or score_val < by_equation[eq_str].score:
-                by_equation[eq_str] = ParetoPoint(
-                    equation=eq_str,
-                    sympy_expr=sympy_expr,
-                    complexity=cand.complexity,
-                    mse=score_val,
-                    score_metric=self.score_metric,
-                )
+            point = ParetoPoint(
+                equation=eq_str,
+                sympy_expr=sympy_expr,
+                complexity=cand.complexity,
+                mse=score_val,
+                score_metric=self.score_metric,
+            )
+            if eq_str not in by_equation or point.score < by_equation[eq_str].score:
+                by_equation[eq_str] = point
 
         if not by_equation:
             print("[nsr] warning: no candidate survived exact evaluation — empty front")

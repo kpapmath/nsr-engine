@@ -64,6 +64,23 @@ print(front.to_frame())
 print("elbow formula:", front.elbow().equation)
 ```
 
+## Full Pipeline Example
+
+A complete runnable script is available at
+`examples/full_pipeline.py`. It generates synthetic data, splits train/test
+rows, trains the lambda sweep, prints the Pareto front, selects the elbow
+formula, and evaluates that formula on held-out rows when SymPy is installed.
+
+```bash
+python examples/full_pipeline.py
+```
+
+Use smaller settings for a fast smoke run:
+
+```bash
+python examples/full_pipeline.py --iters 20 --lambdas 3 --rows 1000
+```
+
 ## Out-of-Core Run
 
 Use the memmap path when the training table is too large to fit comfortably in
@@ -130,8 +147,27 @@ These are the constructor arguments accepted by `NSREngine(...)`.
 | `step_subsample_size` | `None` | Number of rows used for each training iteration reward calculation. For in-memory `fit`, `None` means use all rows. For `fit_memmap`, `None` is treated as `50_000`. |
 | `standardize` | `True` | Whether feature columns are z-scored before training. Returned SymPy formulas are converted back to raw feature terms when possible. |
 | `affine_reward` | `True` | Whether rewards and final scoring use a least-squares affine fit `b0 + b1 * expression` before applying `score_metric`. This makes scoring less sensitive to expression scale and offset. |
-| `score_metric` | `"mse"` | Accuracy metric to minimize. Supported values are `"mse"`, `"rmse"`, and `"mae"`. |
+| `score_metric` | `"mse"` | Accuracy metric. Supported values are `"mse"`, `"rmse"`, `"mae"`, `"mape"`, `"mbd"`, `"r2"`, and `"adjusted_r2"`. |
 | `prefilter_per_complexity` | `16` | Number of best approximate-score candidates to keep per complexity before exact full-set evaluation. |
+
+### Score Metric Values
+
+All metrics are computed on residuals after the optional affine wrapper
+`b0 + b1 * expression`.
+
+| Value | Meaning | Direction |
+| --- | --- | --- |
+| `"mse"` | Mean squared error. | Lower is better. |
+| `"rmse"` | Root mean squared error. | Lower is better. |
+| `"mae"` | Mean absolute error. | Lower is better. |
+| `"mape"` | Mean absolute percentage error, reported as a percentage. Zero target denominators use a small epsilon. | Lower is better. |
+| `"mbd"` | Absolute mean bias deviation. | Lower is better. |
+| `"r2"` | Coefficient of determination. | Higher is better. |
+| `"adjusted_r2"` | Adjusted R squared using one effective predictor, the generated expression. | Higher is better. |
+
+For `"r2"` and `"adjusted_r2"`, `front.to_frame()` reports the actual metric
+value. Pareto dominance still works correctly by maximizing those metrics
+internally.
 
 ## `fit` Arguments
 
@@ -220,5 +256,5 @@ Each point is a `ParetoPoint` with:
 | `sympy_expr` | SymPy expression object for the equation. |
 | `complexity` | Token count of the sampled prefix expression before affine wrapping. |
 | `mse` | Backward-compatible score value field. It contains exact MSE when `score_metric="mse"` and the selected metric value otherwise. |
-| `score` | Alias for the score value used for Pareto dominance. |
-| `score_metric` | Metric used to compute the score: `"mse"`, `"rmse"`, or `"mae"`. |
+| `score` | Internal value used for Pareto dominance. It matches `mse` for lower-is-better metrics and is negated for `"r2"` and `"adjusted_r2"`. |
+| `score_metric` | Metric used to compute the score: `"mse"`, `"rmse"`, `"mae"`, `"mape"`, `"mbd"`, `"r2"`, or `"adjusted_r2"`. |

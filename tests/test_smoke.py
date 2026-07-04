@@ -44,6 +44,23 @@ def test_score_metric_mae():
     assert engine._score(pred, y) == pytest.approx(5.0 / 3.0)
 
 
+@pytest.mark.parametrize(
+    ("metric", "expected"),
+    [
+        ("mape", (0.1 + 0.1 + 0.1) / 3.0 * 100.0),
+        ("mbd", abs((11.0 + 18.0 + 33.0 - 60.0) / 3.0)),
+        ("r2", 0.93),
+        ("adjusted_r2", 0.86),
+    ],
+)
+def test_additional_score_metrics(metric, expected):
+    engine = NSREngine(score_metric=metric, affine_reward=False)
+    pred = np.array([11.0, 18.0, 33.0])
+    y = np.array([10.0, 20.0, 30.0])
+
+    assert engine._score(pred, y) == pytest.approx(expected)
+
+
 def test_score_metric_validation():
     with pytest.raises(ValueError, match="score_metric"):
         NSREngine(score_metric="huber")
@@ -92,3 +109,16 @@ def test_pareto_front_to_frame_uses_metric_column():
     )
 
     assert list(front.to_frame().columns) == ["equation", "complexity", "mae"]
+
+
+def test_pareto_front_maximizes_r2():
+    from nsr_engine.pareto import ParetoPoint
+
+    pts = [
+        ParetoPoint(equation="a", sympy_expr=None, complexity=1, mse=0.7, score_metric="r2"),
+        ParetoPoint(equation="b", sympy_expr=None, complexity=1, mse=0.8, score_metric="r2"),
+    ]
+    front = ParetoFront(pts).dominance_filter()
+
+    assert [p.equation for p in front.points] == ["b"]
+    assert front.to_frame()["r2"].iloc[0] == pytest.approx(0.8)

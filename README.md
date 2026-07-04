@@ -39,13 +39,29 @@ engine = NSREngine(
     n_iters=300,      # REINFORCE iterations per lambda
     batch_size=64,    # expressions sampled per iteration
     max_len=10,       # maximum token sequence length
-    score_metric="mse",  # "mse", "rmse", or "mae"
+    score_metric="mse",  # "mse", "rmse", "mae", "mape", "mbd", "r2", or "adjusted_r2"
     random_state=42,
 )
 front = engine.fit(X, y)
 
 print(front.to_frame())
 print("elbow formula:", front.elbow().equation)
+```
+
+## Full pipeline example
+
+The repository includes a runnable end-to-end example that generates data,
+splits train/test rows, trains the engine, prints the Pareto front, selects the
+elbow formula, and evaluates it on held-out rows when SymPy is installed.
+
+```bash
+python examples/full_pipeline.py
+```
+
+For a quicker smoke run:
+
+```bash
+python examples/full_pipeline.py --iters 20 --lambdas 3 --rows 1000
 ```
 
 ## Token grammar
@@ -89,8 +105,26 @@ front = engine.fit_memmap(store, train_lo=0, train_hi=store.n_rows)
 | `entropy_weight` | 0.005 | Entropy bonus coefficient |
 | `standardize` | True | Z-score features before training |
 | `affine_reward` | True | Score residuals after a least-squares affine fit |
-| `score_metric` | `"mse"` | Accuracy metric to minimize: `"mse"`, `"rmse"`, or `"mae"` |
+| `score_metric` | `"mse"` | Accuracy metric: `"mse"`, `"rmse"`, `"mae"`, `"mape"`, `"mbd"`, `"r2"`, or `"adjusted_r2"` |
 | `cache_dir` | None | Cache lambda runs to disk (JSON) |
+
+## Scoring metrics
+
+`score_metric` controls how expressions are ranked after the optional affine
+fit `b0 + b1 * expression`.
+
+| Value | Meaning | Direction |
+|-------|---------|-----------|
+| `"mse"` | Mean squared error | Lower is better |
+| `"rmse"` | Root mean squared error | Lower is better |
+| `"mae"` | Mean absolute error | Lower is better |
+| `"mape"` | Mean absolute percentage error, reported as percent | Lower is better |
+| `"mbd"` | Absolute mean bias deviation | Lower is better |
+| `"r2"` | Coefficient of determination | Higher is better |
+| `"adjusted_r2"` | Adjusted R squared using one effective predictor | Higher is better |
+
+For `r2` and `adjusted_r2`, `front.to_frame()` reports the actual R squared
+value while Pareto dominance maximizes it internally.
 
 ## Reference
 
