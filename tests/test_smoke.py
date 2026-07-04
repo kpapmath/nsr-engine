@@ -36,6 +36,19 @@ def test_fit_returns_pareto_front():
     assert len(front) >= 0  # may be empty for very short runs
 
 
+def test_score_metric_mae():
+    engine = NSREngine(score_metric="mae", affine_reward=False)
+    pred = np.array([1.0, 3.0, 6.0])
+    y = np.array([0.0, 4.0, 3.0])
+
+    assert engine._score(pred, y) == pytest.approx(5.0 / 3.0)
+
+
+def test_score_metric_validation():
+    with pytest.raises(ValueError, match="score_metric"):
+        NSREngine(score_metric="huber")
+
+
 def test_pareto_front_dominance_filter():
     from nsr_engine.pareto import ParetoPoint
 
@@ -61,3 +74,21 @@ def test_pareto_front_elbow():
     ]
     elbow = ParetoFront(pts).elbow()
     assert elbow.equation == "b"
+
+
+def test_pareto_front_to_frame_uses_metric_column():
+    from nsr_engine.pareto import ParetoPoint
+
+    front = ParetoFront(
+        [
+            ParetoPoint(
+                equation="a",
+                sympy_expr=None,
+                complexity=1,
+                mse=0.2,
+                score_metric="mae",
+            )
+        ]
+    )
+
+    assert list(front.to_frame().columns) == ["equation", "complexity", "mae"]

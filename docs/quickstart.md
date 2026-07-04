@@ -54,6 +54,7 @@ engine = NSREngine(
     n_iters=300,
     batch_size=64,
     max_len=10,
+    score_metric="mse",
     random_state=42,
 )
 
@@ -87,6 +88,7 @@ engine = NSREngine(
     batch_size=64,
     max_len=10,
     step_subsample_size=50_000,
+    score_metric="mae",
     random_state=42,
 )
 
@@ -127,8 +129,9 @@ These are the constructor arguments accepted by `NSREngine(...)`.
 | `device` | `"auto"` | Torch device. `"auto"` selects CUDA, then Apple MPS, then CPU. You may also pass values such as `"cpu"` or `"cuda"`. |
 | `step_subsample_size` | `None` | Number of rows used for each training iteration reward calculation. For in-memory `fit`, `None` means use all rows. For `fit_memmap`, `None` is treated as `50_000`. |
 | `standardize` | `True` | Whether feature columns are z-scored before training. Returned SymPy formulas are converted back to raw feature terms when possible. |
-| `affine_reward` | `True` | Whether rewards and final scoring use the best affine fit `b0 + b1 * expression`. This makes scoring invariant to expression scale and offset. |
-| `prefilter_per_complexity` | `16` | Number of best approximate-MSE candidates to keep per complexity before exact full-set evaluation. |
+| `affine_reward` | `True` | Whether rewards and final scoring use a least-squares affine fit `b0 + b1 * expression` before applying `score_metric`. This makes scoring less sensitive to expression scale and offset. |
+| `score_metric` | `"mse"` | Accuracy metric to minimize. Supported values are `"mse"`, `"rmse"`, and `"mae"`. |
+| `prefilter_per_complexity` | `16` | Number of best approximate-score candidates to keep per complexity before exact full-set evaluation. |
 
 ## `fit` Arguments
 
@@ -167,7 +170,7 @@ front = engine.fit_memmap(
 | `store` | required | `MemmapDataset` returned by `build_memmap_dataset(...)`. |
 | `train_lo` | required | Inclusive lower row bound for training and exact scoring. |
 | `train_hi` | required | Exclusive upper row bound for training and exact scoring. Must leave at least two rows. |
-| `chunk_rows` | `5_000_000` | Number of rows streamed at a time during standardization stats and exact MSE evaluation. |
+| `chunk_rows` | `5_000_000` | Number of rows streamed at a time during standardization stats and exact score evaluation. |
 | `prefilter_per_complexity` | `None` | Per-call override for the engine-level `prefilter_per_complexity`. |
 
 ## `build_memmap_dataset` Arguments
@@ -204,8 +207,8 @@ and source file signatures match.
 
 | Method | Arguments | Explanation |
 | --- | --- | --- |
-| `front.to_frame()` | none | Returns a `pandas.DataFrame` with `equation`, `complexity`, and `mse` sorted by complexity. |
-| `front.elbow()` | none | Returns the point with the largest MSE drop per unit complexity increase. |
+| `front.to_frame()` | none | Returns a `pandas.DataFrame` with `equation`, `complexity`, and the selected metric column sorted by complexity. |
+| `front.elbow()` | none | Returns the point with the largest score drop per unit complexity increase. |
 | `front.dominance_filter()` | none | Returns a new front containing only non-dominated points. |
 | `len(front)` | none | Returns the number of points in the front. |
 
@@ -216,5 +219,6 @@ Each point is a `ParetoPoint` with:
 | `equation` | Human-readable equation string. Requires SymPy conversion to succeed. |
 | `sympy_expr` | SymPy expression object for the equation. |
 | `complexity` | Token count of the sampled prefix expression before affine wrapping. |
-| `mse` | Exact MSE after the final evaluation stage. |
-
+| `mse` | Backward-compatible score value field. It contains exact MSE when `score_metric="mse"` and the selected metric value otherwise. |
+| `score` | Alias for the score value used for Pareto dominance. |
+| `score_metric` | Metric used to compute the score: `"mse"`, `"rmse"`, or `"mae"`. |

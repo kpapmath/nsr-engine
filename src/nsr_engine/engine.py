@@ -10,7 +10,7 @@ module implements the equivalent approach described in Petersen et al. 2021:
 
 Single-objective -> Pareto via lambda-sweep
 -------------------------------------------
-Reward: R = 1/(1+NMSE) - lambda * complexity
+Reward: R = 1/(1+normalized_score) - lambda * complexity
 Sweep lambda over a log-spaced grid; one policy trained per lambda.
 Pool all discovered expressions across all lambda runs, evaluate on a common
 split, then apply dominance_filter() to assemble the front.
@@ -32,8 +32,9 @@ Performance design
   arity-mask tensors, instead of a Python loop per sequence per step.
 * During training only cheap numpy rewards are computed on the (standardized,
   float32) step data.  Candidates are tracked as token tuples with their best
-  subsample MSE; the exact full-set MSE and the sympy conversion happen once
-  after the lambda-sweep, for a small pre-filtered set (top-K per complexity).
+  subsample score; the exact full-set score and the sympy conversion happen
+  once after the lambda-sweep, for a small pre-filtered set (top-K per
+  complexity).
 * Expression evaluation runs in float32 (halving temporary-array RAM); the
   affine least-squares scoring casts the masked prediction vector to float64
   so accumulated statistics stay accurate.
@@ -74,6 +75,7 @@ _CONST_TOKENS: tuple[str, ...] = ("-1.0", "-0.5", "0.5", "1.0", "2.0")
 _CONST_VALUES: dict[str, float] = {t: float(t) for t in _CONST_TOKENS}
 
 _START_TOKEN = "<s>"  # sentinel fed at step 0
+_SCORE_METRICS: tuple[str, ...] = ("mse", "rmse", "mae")
 
 
 def _get_arity(
@@ -206,6 +208,33 @@ def _affine_residual(
     b0 = my - b1 * mp
     resid_sse = max(syy - cov * cov / var_p, 0.0)
     return resid_sse / n, b0, b1
+
+
+def _metric_from_residuals(resid: np.ndarray, metric: str) -> float:
+    resid = np.asarray(resid, dtype=np.float64)
+    if metric == "mse":
+        return float(np.mean(resid * resid))
+    if metric == "rmse":
+        return float(math.sqrt(float(np.mean(resid * resid))))
+    if metric == "mae":
+        return float(np.mean(np.abs(resid)))
+    raise ValueError(f"unsupported score_metric={metric!r}")
+
+
+def _target_metric_scale(y: np.ndarray, metric: str) -> float:
+    y = np.asarray(y, dtype=np.float64)
+    if y.size == 0:
+        return 1.0
+    centered = y - float(np.mean(y))
+    if metric == "mse":
+        scale = float(np.mean(centered * centered))
+    elif metric == "rmse":
+        scale = float(math.sqrt(float(np.mean(centered * centered))))
+    elif metric == "mae":
+        scale = float(np.mean(np.abs(centered)))
+    else:
+        raise ValueError(f"unsupported score_metric={metric!r}")
+    return max(scale, 1e-10)
 
 
 # ---------------------------------------------------------------------------
@@ -541,8 +570,11 @@ class NSREngine:
     cache_dir:
         Directory for caching discovered candidates (JSON per lambda).
         If ``None``, no cache is written.
+    score_metric:
+        Accuracy metric to minimize. Supported values are ``"mse"``,
+        ``"rmse"``, and ``"mae"``.
     prefilter_per_complexity:
-        How many lowest-approx-MSE candidates per complexity level survive to
+        How many lowest-approx-score candidates per complexity level survive to
         the exact scoring + sympy-conversion stage.
     """
 
@@ -571,12 +603,17 @@ class NSREngine:
         step_subsample_size: int | None = None,
         standardize: bool = True,
         affine_reward: bool = True,
+        score_metric: str = "mse",
         prefilter_per_complexity: int = 16,
     ) -> None:
         if not _TORCH_AVAILABLE:
             raise ImportError(
                 "torch is required for NSREngine.  Install with: pip install torch"
             )
+        score_metric = score_metric.lower()
+        if score_metric not in _SCORE_METRICS:
+            supported = ", ".join(repr(m) for m in _SCORE_METRICS)
+            raise ValueError(f"score_metric must be one of: {supported}")
         self.lambda_grid = (
             tuple(lambda_grid)
             if lambda_grid is not None
@@ -600,6 +637,7 @@ class NSREngine:
         self.step_subsample_size = step_subsample_size
         self.standardize = standardize
         self.affine_reward = affine_reward
+        self.score_metric = score_metric
         self.prefilter_per_complexity = prefilter_per_complexity
         self._feat_mean: dict[str, float] | None = None
         self._feat_std: dict[str, float] | None = None
@@ -688,9 +726,15 @@ class NSREngine:
     def _score(self, pred: np.ndarray, y: np.ndarray) -> float | None:
         if self.affine_reward:
             res = _affine_residual(pred, y)
-            return None if res is None else res[0]
-        diff = np.asarray(pred, dtype=np.float64) - np.asarray(y, dtype=np.float64)
-        return float(np.mean(diff * diff))
+            if res is None:
+                return None
+            _, b0, b1 = res
+            resid = np.asarray(y, dtype=np.float64) - (
+                b0 + b1 * np.asarray(pred, dtype=np.float64)
+            )
+        else:
+            resid = np.asarray(y, dtype=np.float64) - np.asarray(pred, dtype=np.float64)
+        return _metric_from_residuals(resid, self.score_metric)
 
     @staticmethod
     def _warn_negative_columns(X: pd.DataFrame) -> None:
@@ -735,11 +779,11 @@ class NSREngine:
             and self.step_subsample_size < n_rows
         )
         all_indices = np.arange(n_rows)
-        y_var_full = max(float(np.nanvar(y_arr)), 1e-10)
+        y_score_scale_full = _target_metric_scale(y_arr[np.isfinite(y_arr)], self.score_metric)
 
         def sample_step() -> tuple[dict[str, np.ndarray], np.ndarray, float]:
             if not subsample:
-                return arrays, y_arr, y_var_full
+                return arrays, y_arr, y_score_scale_full
             k = self.step_subsample_size or n_rows
             if subsample_regime_ids is not None:
                 cells = np.unique(subsample_regime_ids)
@@ -754,7 +798,8 @@ class NSREngine:
                 idx = np.random.choice(all_indices, size=k, replace=False)
             step_arrays = {col: arr[idx] for col, arr in arrays.items()}
             step_y = y_arr[idx]
-            return step_arrays, step_y, max(float(np.nanvar(step_y)), 1e-10)
+            finite_y = step_y[np.isfinite(step_y)]
+            return step_arrays, step_y, _target_metric_scale(finite_y, self.score_metric)
 
         pool = self._sweep_lambdas(lib, sample_step, device)
         if not pool:
@@ -765,7 +810,7 @@ class NSREngine:
             list(pool.values()), per_complexity=self.prefilter_per_complexity
         )
         print(
-            f"[nsr] exact full-set MSE for {len(candidates)} candidates "
+            f"[nsr] exact full-set {self.score_metric.upper()} for {len(candidates)} candidates "
             f"({n_rows:,} rows) …",
             flush=True,
         )
@@ -811,7 +856,8 @@ class NSREngine:
         print(
             f"[nsr] device={device}  mode=out-of-core  "
             f"train_rows={train_hi - train_lo:,}  step_subsample={step_n:,}  "
-            f"standardize={self.standardize}  affine_reward={self.affine_reward}",
+            f"standardize={self.standardize}  affine_reward={self.affine_reward}  "
+            f"score_metric={self.score_metric}",
             flush=True,
         )
         lib = _make_library(
@@ -826,7 +872,8 @@ class NSREngine:
             idx = np.random.randint(train_lo, train_hi, size=step_n)
             step_arrays, step_y = store.gather(idx)
             step_arrays = self._standardize_arrays(step_arrays, inplace=True)
-            return step_arrays, step_y, max(float(np.nanvar(step_y)), 1e-10)
+            finite_y = step_y[np.isfinite(step_y)]
+            return step_arrays, step_y, _target_metric_scale(finite_y, self.score_metric)
 
         pool = self._sweep_lambdas(lib, sample_step, device)
         if not pool:
@@ -837,11 +884,11 @@ class NSREngine:
             list(pool.values()), per_complexity=per_complexity
         )
         print(
-            f"[nsr] exact full-set MSE for {len(candidates)} candidates "
+            f"[nsr] exact full-set {self.score_metric.upper()} for {len(candidates)} candidates "
             f"by streaming {train_hi - train_lo:,} rows in chunks of {chunk_rows:,} …",
             flush=True,
         )
-        exact = self._exact_mse_streaming(
+        exact = self._exact_score_streaming(
             candidates, store, train_lo, train_hi, chunk_rows
         )
         return self._assemble_front(exact)
@@ -904,7 +951,7 @@ class NSREngine:
         hb = Heartbeat(f"nsr-train lambda={lam:.4g}", interval_s=30.0)
 
         for iteration in range(self.n_iters):
-            step_arrays, step_y, step_y_var = sample_step()
+            step_arrays, step_y, step_score_scale = sample_step()
             step_n = len(step_y)
             step_y_finite = np.isfinite(step_y)
 
@@ -925,15 +972,15 @@ class NSREngine:
                 if pred is not None:
                     valid_mask = step_y_finite & np.isfinite(pred)
                     if valid_mask.sum() >= 2:
-                        mse_val = self._score(pred[valid_mask], step_y[valid_mask])
-                        if mse_val is not None:
-                            nmse = mse_val / step_y_var
-                            r = 1.0 / (1.0 + nmse) - lam * len(tokens)
-                            if key not in discovered or mse_val < discovered[key].approx_mse:
+                        score_val = self._score(pred[valid_mask], step_y[valid_mask])
+                        if score_val is not None:
+                            normalized_score = score_val / step_score_scale
+                            r = 1.0 / (1.0 + normalized_score) - lam * len(tokens)
+                            if key not in discovered or score_val < discovered[key].approx_mse:
                                 discovered[key] = _OOCExpr(
                                     tokens=key,
                                     complexity=len(tokens),
-                                    approx_mse=mse_val,
+                                    approx_mse=score_val,
                                 )
                 iter_rewards[key] = r
                 rewards.append(r)
@@ -1006,13 +1053,17 @@ class NSREngine:
                 if fit is None:
                     out.append((cand, float("nan"), 0.0, 1.0))
                 else:
-                    out.append((cand, fit[0], fit[1], fit[2]))
+                    _, b0, b1 = fit
+                    resid = np.asarray(ym, dtype=np.float64) - (
+                        b0 + b1 * np.asarray(pm, dtype=np.float64)
+                    )
+                    out.append((cand, _metric_from_residuals(resid, self.score_metric), b0, b1))
             else:
-                diff = ym - np.asarray(pm, dtype=np.float64)
-                out.append((cand, float(np.mean(diff * diff)), 0.0, 1.0))
+                resid = np.asarray(ym, dtype=np.float64) - np.asarray(pm, dtype=np.float64)
+                out.append((cand, _metric_from_residuals(resid, self.score_metric), 0.0, 1.0))
         return out
 
-    def _exact_mse_streaming(
+    def _exact_score_streaming(
         self,
         candidates: list[_OOCExpr],
         store: "MemmapDataset",
@@ -1033,7 +1084,7 @@ class NSREngine:
         token_lists = [list(c.tokens) for c in candidates]
 
         ranges = chunk_ranges(lo, hi, chunk_rows)
-        hb = Heartbeat("nsr-exact-mse", interval_s=20.0)
+        hb = Heartbeat(f"nsr-exact-{self.score_metric}", interval_s=20.0)
         for ci, (start, stop) in enumerate(ranges):
             arrays, y = store.gather(slice(start, stop))
             arrays = self._standardize_arrays(arrays, inplace=True)
@@ -1069,23 +1120,59 @@ class NSREngine:
             cov = spy[k] - sp_[k] * sy[k] / n
             syy_c = syy[k] - sy[k] * sy[k] / n
             if not self.affine_reward:
-                plain = (syy[k] - 2.0 * spy[k] + spp[k]) / n
-                out.append((cand, plain, 0.0, 1.0))
+                mse = max((syy[k] - 2.0 * spy[k] + spp[k]) / n, 0.0)
+                score = math.sqrt(mse) if self.score_metric == "rmse" else mse
+                out.append((cand, score, 0.0, 1.0))
             elif var_p < 1e-18:
-                out.append((cand, max(syy_c, 0.0) / n, mean_y, 0.0))
+                mse = max(syy_c, 0.0) / n
+                score = math.sqrt(mse) if self.score_metric == "rmse" else mse
+                out.append((cand, score, mean_y, 0.0))
             else:
                 b1 = cov / var_p
                 b0 = mean_y - b1 * mean_p
-                resid = max(syy_c - cov * cov / var_p, 0.0) / n
-                out.append((cand, resid, b0, b1))
-        return out
+                mse = max(syy_c - cov * cov / var_p, 0.0) / n
+                score = math.sqrt(mse) if self.score_metric == "rmse" else mse
+                out.append((cand, score, b0, b1))
+
+        if self.score_metric != "mae":
+            return out
+
+        abs_sum = np.zeros(k_n)
+        hb = Heartbeat("nsr-exact-mae-pass2", interval_s=20.0)
+        params = [(b0, b1) for _, _, b0, b1 in out]
+        ranges = chunk_ranges(lo, hi, chunk_rows)
+        for ci, (start, stop) in enumerate(ranges):
+            arrays, y = store.gather(slice(start, stop))
+            arrays = self._standardize_arrays(arrays, inplace=True)
+            n_rows = stop - start
+            y_finite = np.isfinite(y)
+            for k, toks in enumerate(token_lists):
+                if cnt[k] < 2:
+                    continue
+                pred = _eval_prefix_numpy(toks, arrays, n_rows)
+                if pred is None:
+                    continue
+                mask = y_finite & np.isfinite(pred)
+                if not int(mask.sum()):
+                    continue
+                b0, b1 = params[k]
+                resid = np.asarray(y[mask], dtype=np.float64) - (
+                    b0 + b1 * np.asarray(pred[mask], dtype=np.float64)
+                )
+                abs_sum[k] += float(np.abs(resid).sum())
+            hb.beat(f"chunk {ci + 1}/{len(ranges)}  rows<= {stop:,}", force=(ci == 0))
+
+        return [
+            (cand, abs_sum[k] / int(cnt[k]) if int(cnt[k]) >= 2 else float("nan"), b0, b1)
+            for k, (cand, _, b0, b1) in enumerate(out)
+        ]
 
     def _assemble_front(
         self, exact: list[tuple[_OOCExpr, float, float, float]]
     ) -> ParetoFront:
         by_equation: dict[str, ParetoPoint] = {}
-        for cand, mse_val, b0, b1 in exact:
-            if not math.isfinite(mse_val):
+        for cand, score_val, b0, b1 in exact:
+            if not math.isfinite(score_val):
                 continue
             converted = _to_sympy_affine(
                 list(cand.tokens), b0, b1, self._feat_mean, self._feat_std
@@ -1093,12 +1180,13 @@ class NSREngine:
             if converted is None:
                 continue
             eq_str, sympy_expr = converted
-            if eq_str not in by_equation or mse_val < by_equation[eq_str].mse:
+            if eq_str not in by_equation or score_val < by_equation[eq_str].score:
                 by_equation[eq_str] = ParetoPoint(
                     equation=eq_str,
                     sympy_expr=sympy_expr,
                     complexity=cand.complexity,
-                    mse=mse_val,
+                    mse=score_val,
+                    score_metric=self.score_metric,
                 )
 
         if not by_equation:
@@ -1127,8 +1215,10 @@ class NSREngine:
         if path is None:
             return
         data = {
-            "version": 2,
+            "version": 3,
             "lambda": lam,
+            "score_metric": self.score_metric,
+            "affine_reward": self.affine_reward,
             "candidates": [
                 {
                     "tokens": list(d.tokens),
@@ -1146,7 +1236,16 @@ class NSREngine:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            if data.get("version") != 2:
+            version = data.get("version")
+            if version == 2:
+                if self.score_metric != "mse" or not self.affine_reward:
+                    return None
+            elif version == 3:
+                if data.get("score_metric") != self.score_metric:
+                    return None
+                if bool(data.get("affine_reward")) != self.affine_reward:
+                    return None
+            else:
                 return None
             result: dict[tuple[str, ...], _OOCExpr] = {}
             for entry in data.get("candidates", []):

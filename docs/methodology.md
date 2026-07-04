@@ -20,8 +20,8 @@ flowchart TD
     H --> E
     E --> I[Collect unique valid candidate token sequences]
     I --> J[Pool candidates across lambdas]
-    J --> K[Prefilter by approximate MSE per complexity]
-    K --> L[Exact full-set MSE evaluation]
+    J --> K[Prefilter by approximate score per complexity]
+    K --> L[Exact full-set score evaluation]
     L --> M[Convert surviving expressions to SymPy]
     M --> N[Dominance filter]
     N --> O[ParetoFront]
@@ -118,37 +118,46 @@ that are removed from scoring.
 Candidates need at least two finite aligned prediction and target values to be
 scored.
 
-## Affine Reward
+## Scoring Metrics and Affine Reward
 
 By default, the engine does not score a raw expression directly. It first fits
-the best affine wrapper:
+a least-squares affine wrapper:
 
 ```text
 y_hat = b0 + b1 * expression
 ```
 
-The least-squares residual MSE of that wrapper becomes the expression MSE. This
-makes the reward less sensitive to scale and offset, so a structurally useful
-expression can be discovered even if it needs linear calibration.
+The affine wrapper is fit by least squares. The residuals from that calibrated
+expression are then scored with `score_metric`. Supported metrics are:
+
+| `score_metric` | Meaning |
+| --- | --- |
+| `"mse"` | Mean squared error. |
+| `"rmse"` | Root mean squared error. |
+| `"mae"` | Mean absolute error. |
+
+This makes the reward less sensitive to scale and offset, so a structurally
+useful expression can be discovered even if it needs linear calibration.
 
 ```mermaid
 flowchart TD
     A[Sampled expression f X] --> B[Prediction vector p]
     B --> C[Fit b0 + b1 p to y]
-    C --> D[Residual MSE]
-    D --> E[Normalize by variance of y]
+    C --> D[Residual score]
+    D --> E[Normalize by matching target scale]
     E --> F[Reward]
 ```
 
 The reward used during training is:
 
 ```text
-NMSE = MSE / var(y)
-reward = 1 / (1 + NMSE) - lambda * complexity
+normalized_score = score / target_scale
+reward = 1 / (1 + normalized_score) - lambda * complexity
 ```
 
 If `affine_reward=False`, the engine scores the raw expression directly with
-plain MSE.
+the selected metric. The default `score_metric` is `"mse"` to preserve the
+original behavior.
 
 ## Risk-Seeking REINFORCE
 
@@ -165,7 +174,7 @@ sequenceDiagram
     participant Opt as Adam optimizer
 
     Policy->>Eval: Sample batch of expressions
-    Eval->>Reward: MSE, NMSE, complexity-adjusted reward
+    Eval->>Reward: Score, normalized score, complexity-adjusted reward
     Reward->>Reward: Select elite reward tail
     Reward->>Opt: Advantage times log probability
     Opt->>Policy: Gradient step with entropy bonus
@@ -195,7 +204,7 @@ flowchart LR
     P1 --> U[Union by token sequence]
     P2 --> U
     P3 --> U
-    U --> C[Best approximate MSE per candidate]
+    U --> C[Best approximate score per candidate]
     C --> F[Final Pareto front]
 ```
 
@@ -207,7 +216,7 @@ The default grid is log-spaced from `lambda_min=1e-4` to `lambda_max=1e-1`.
 
 Training uses approximate rewards, often on row subsamples. Before building the
 front, the engine reduces the candidate pool by keeping the lowest approximate
-MSE candidates within each complexity level. The number kept is controlled by
+score candidates within each complexity level. The number kept is controlled by
 `prefilter_per_complexity`.
 
 After prefiltering, candidates are evaluated exactly on the complete in-memory
@@ -216,9 +225,9 @@ training set, or by streaming the requested memmap row range in chunks.
 ```mermaid
 flowchart TD
     A[All discovered candidates] --> B[Group by token count]
-    B --> C[Sort each group by approximate MSE]
+    B --> C[Sort each group by approximate score]
     C --> D[Keep top K per complexity]
-    D --> E[Evaluate exact MSE]
+    D --> E[Evaluate exact score]
     E --> F[Convert to affine SymPy expression]
     F --> G[Deduplicate by equation string]
 ```
@@ -233,7 +242,7 @@ Each surviving expression has two objectives:
 | Objective | Direction |
 | --- | --- |
 | `complexity` | Lower is better. |
-| `mse` | Lower is better. |
+| selected score metric | Lower is better. |
 
 Point A dominates point B when A is no worse in both objectives and strictly
 better in at least one. The final front keeps only non-dominated points.
@@ -247,7 +256,7 @@ flowchart TD
 ```
 
 The `elbow()` helper sorts points by complexity and returns the formula with
-the largest MSE drop per added unit of complexity.
+the largest score drop per added unit of complexity.
 
 ## In-Memory Versus Memmap Training
 
@@ -258,8 +267,8 @@ flowchart TD
     C --> D[fit_memmap]
     B --> E[Random subsample optional]
     D --> F[Random subsample per iteration required or defaulted]
-    E --> G[Exact MSE on full arrays]
-    F --> H[Exact MSE by streaming chunks]
+    E --> G[Exact score on full arrays]
+    F --> H[Exact score by streaming chunks]
     G --> I[ParetoFront]
     H --> I
 ```
@@ -312,4 +321,3 @@ or, when `cache_prefix` is set:
 | Lower memory during training | Set `step_subsample_size` or use `fit_memmap`. |
 | Better final candidate diversity | Increase `prefilter_per_complexity`. |
 | Reproducible experiments | Set `random_state`, cache with `cache_dir`, and keep data ordering fixed. |
-

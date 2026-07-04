@@ -39,6 +39,7 @@ engine = NSREngine(
     n_iters=300,      # REINFORCE iterations per lambda
     batch_size=64,    # expressions sampled per iteration
     max_len=10,       # maximum token sequence length
+    score_metric="mse",  # "mse", "rmse", or "mae"
     random_state=42,
 )
 front = engine.fit(X, y)
@@ -87,7 +88,8 @@ front = engine.fit_memmap(store, train_lo=0, train_hi=store.n_rows)
 | `elite_frac` | 0.05 | Risk-seeking quantile ε |
 | `entropy_weight` | 0.005 | Entropy bonus coefficient |
 | `standardize` | True | Z-score features before training |
-| `affine_reward` | True | Reward = best affine fit residual |
+| `affine_reward` | True | Score residuals after a least-squares affine fit |
+| `score_metric` | `"mse"` | Accuracy metric to minimize: `"mse"`, `"rmse"`, or `"mae"` |
 | `cache_dir` | None | Cache lambda runs to disk (JSON) |
 
 ## Reference
