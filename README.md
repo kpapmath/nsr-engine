@@ -93,6 +93,23 @@ nsr-engine
 nsr-engine --help
 ```
 
+## Pipeline case examples
+
+Functional examples for each distinct pipeline path are split into standalone
+scripts. See `docs/pipeline_examples.md` for the full summary.
+
+```bash
+python examples/generated_train_test.py
+python examples/generated_validation.py
+python examples/csv_input.py
+python examples/custom_metric_library.py
+python examples/cached_run.py
+python examples/memmap_out_of_core.py
+```
+
+The defaults are small CPU-sized smoke examples; increase `--iters`,
+`--lambdas`, and `--rows` for stronger searches.
+
 ## Token grammar
 
 | Type       | Tokens                     |
