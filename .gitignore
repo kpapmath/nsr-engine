@@ -12,3 +12,4 @@ venv/
 nsr_cache/
 .pytest_cache/
 .mypy_cache/
+**/src/nsr_engine.egg-info

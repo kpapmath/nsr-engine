@@ -5,6 +5,10 @@ import pandas as pd
 import pytest
 
 from nsr_engine import NSREngine, ParetoFront
+from examples.full_pipeline import (
+    train_test_validation_split,
+    validate_split_fractions,
+)
 
 
 def _make_data(n: int = 300, seed: int = 0) -> tuple[pd.DataFrame, pd.Series]:
@@ -64,6 +68,62 @@ def test_additional_score_metrics(metric, expected):
 def test_score_metric_validation():
     with pytest.raises(ValueError, match="score_metric"):
         NSREngine(score_metric="huber")
+
+
+def test_train_test_split_defaults_without_validation():
+    X, y = _make_data(n=10)
+
+    X_train, X_test, X_validation, y_train, y_test, y_validation = (
+        train_test_validation_split(
+            X,
+            y,
+            train_frac=0.8,
+            test_frac=0.2,
+            validation_frac=None,
+            seed=1,
+        )
+    )
+
+    assert len(X_train) == 8
+    assert len(y_train) == 8
+    assert len(X_test) == 2
+    assert len(y_test) == 2
+    assert X_validation is None
+    assert y_validation is None
+
+
+def test_train_test_validation_split():
+    X, y = _make_data(n=10)
+
+    X_train, X_test, X_validation, y_train, y_test, y_validation = (
+        train_test_validation_split(
+            X,
+            y,
+            train_frac=0.7,
+            test_frac=0.2,
+            validation_frac=0.1,
+            seed=1,
+        )
+    )
+
+    assert len(X_train) == 7
+    assert len(y_train) == 7
+    assert len(X_test) == 2
+    assert len(y_test) == 2
+    assert X_validation is not None
+    assert y_validation is not None
+    assert len(X_validation) == 1
+    assert len(y_validation) == 1
+
+
+def test_split_fraction_range_validation():
+    with pytest.raises(ValueError, match=r"in \[0, 1\]"):
+        validate_split_fractions(1.2, -0.2, None)
+
+
+def test_split_fraction_sum_validation():
+    with pytest.raises(ValueError, match="sum to 1.0"):
+        validate_split_fractions(0.7, 0.2, None)
 
 
 def test_pareto_front_dominance_filter():

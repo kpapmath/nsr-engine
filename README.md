@@ -50,18 +50,47 @@ print("elbow formula:", front.elbow().equation)
 
 ## Full pipeline example
 
-The repository includes a runnable end-to-end example that generates data,
-splits train/test rows, trains the engine, prints the Pareto front, selects the
-elbow formula, and evaluates it on held-out rows when SymPy is installed.
+The repository includes a runnable end-to-end pipeline that generates data or
+loads a CSV, splits train/test rows with optional validation rows, trains the
+engine, prints the Pareto front, selects the elbow formula, and evaluates it on
+held-out rows when SymPy is installed.
+
+```bash
+python main.py
+```
+
+The example wrapper and package module entry point are equivalent:
 
 ```bash
 python examples/full_pipeline.py
+python -m nsr_engine.main
+```
+
+By default the example uses `--train-frac 0.8 --test-frac 0.2`. Add
+`--validation-frac` to use train/test/validation splits, for example:
+
+```bash
+python main.py --train-frac 0.7 --test-frac 0.2 --validation-frac 0.1
 ```
 
 For a quicker smoke run:
 
 ```bash
-python examples/full_pipeline.py --iters 20 --lambdas 3 --rows 1000
+python main.py --iters 20 --lambdas 3 --rows 1000
+```
+
+To run on your own CSV data, provide the target column and optionally a
+comma-separated feature list:
+
+```bash
+python main.py --input-csv data.csv --target-col y --feature-cols a,b,c
+```
+
+After installation, the same CLI is available as:
+
+```bash
+nsr-engine
+nsr-engine --help
 ```
 
 ## Token grammar

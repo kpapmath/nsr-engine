@@ -22,6 +22,9 @@ dependencies = [
   "torch>=2.0",
 ]
 
+[project.scripts]
+nsr-engine = "nsr_engine.main:main"
+
 [project.optional-dependencies]
 sympy = ["sympy>=1.12"]
 memmap = ["pyarrow>=14.0"]
