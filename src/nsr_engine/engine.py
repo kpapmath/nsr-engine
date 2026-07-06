@@ -18,7 +18,11 @@ split, then apply dominance_filter() to assemble the front.
 Token grammar
 -------------
 Binary ops  : + - * /         (arity 2)
-Unary ops   : square abs log  (arity 1)
+Unary ops   : square abs log  (arity 1, defaults)
+              Extra unary ops are available on opt-in (via ``unary_ops=`` /
+              ``--unary-ops``) without changing the defaults; see
+              ``_SUPPORTED_UNARY_OPS`` for the full menu (sqrt, exp, sin, cos,
+              tan, tanh, arctan, arctanh, log10, ...).
 Variables   : feature columns  (arity 0 / terminal)
 Constants   : -1 -0.5 0.5 1 2 (arity 0 / terminal)
 
@@ -72,6 +76,92 @@ except ImportError:
 _BINARY_OPS: tuple[str, ...] = ("+", "-", "*", "/")
 _UNARY_OPS: tuple[str, ...] = ("square", "abs", "log")
 _CONST_TOKENS: tuple[str, ...] = ("-1.0", "-0.5", "0.5", "1.0", "2.0")
+
+
+# ---------------------------------------------------------------------------
+# Extended unary-op registry
+# ---------------------------------------------------------------------------
+# ``_UNARY_OPS`` above is the *default* op set the engine ships with.  The
+# registries below make a broader menu of unary functions *available* so callers
+# can opt in via ``unary_ops=`` / ``--unary-ops`` without any code change --
+# arity, vocab ordering and the sampling masks are all derived from the active
+# op tuple, so a registered token "just works" once selected.  Defaults are left
+# untouched; unregistered names are rejected at construction time.
+#
+# Every numeric branch is NaN/inf-safe: values are computed in the array dtype
+# (float32 during training), restricted-domain ops guard their input, and
+# non-finite results collapse to NaN so affine scoring can mask them out.
+
+def _finite_np(x: "np.ndarray") -> "np.ndarray":
+    """Replace +/-inf with NaN so downstream scoring can mask them out."""
+    return np.where(np.isfinite(x), x, np.nan)
+
+
+_NUMPY_UNARY: dict[str, Any] = {
+    "square": lambda a: a ** 2,
+    "cube": lambda a: _finite_np(a ** 3),
+    "abs": lambda a: np.abs(a),
+    "neg": lambda a: -a,
+    "sign": lambda a: np.sign(a),
+    "sqrt": lambda a: np.sqrt(np.abs(a)),
+    "cbrt": lambda a: np.cbrt(a),
+    "reciprocal": lambda a: 1.0 / np.where(np.abs(a) < 1e-9, np.nan, a),
+    "log": lambda a: np.log(np.abs(a) + 1e-10),
+    "log10": lambda a: np.log10(np.abs(a) + 1e-10),
+    "log2": lambda a: np.log2(np.abs(a) + 1e-10),
+    "exp": lambda a: _finite_np(np.exp(a)),
+    "sin": lambda a: np.sin(a),
+    "cos": lambda a: np.cos(a),
+    "tan": lambda a: _finite_np(np.tan(a)),
+    "sinh": lambda a: _finite_np(np.sinh(a)),
+    "cosh": lambda a: _finite_np(np.cosh(a)),
+    "tanh": lambda a: np.tanh(a),
+    "arcsin": lambda a: np.arcsin(np.clip(a, -1.0, 1.0)),
+    "arccos": lambda a: np.arccos(np.clip(a, -1.0, 1.0)),
+    "arctan": lambda a: np.arctan(a),
+    "arcsinh": lambda a: np.arcsinh(a),
+    "arctanh": lambda a: np.arctanh(np.clip(a, -1.0 + 1e-7, 1.0 - 1e-7)),
+    "sigmoid": lambda a: 1.0 / (1.0 + np.exp(-np.clip(a, -50.0, 50.0))),
+}
+
+
+def _sympy_unary_map(sp: Any) -> dict[str, Any]:
+    """Sympy equivalents of :data:`_NUMPY_UNARY`, for equation rendering.
+
+    Kept key-for-key in sync with :data:`_NUMPY_UNARY` so the printed formula
+    matches what was evaluated numerically (same domain guards on log/sqrt/etc).
+    """
+    eps = sp.Float(1e-10)
+    return {
+        "square": lambda a: a ** 2,
+        "cube": lambda a: a ** 3,
+        "abs": lambda a: sp.Abs(a),
+        "neg": lambda a: -a,
+        "sign": lambda a: sp.sign(a),
+        "sqrt": lambda a: sp.sqrt(sp.Abs(a)),
+        "cbrt": lambda a: sp.cbrt(a),
+        "reciprocal": lambda a: 1 / (a + sp.Float(1e-9)),
+        "log": lambda a: sp.log(sp.Abs(a) + eps),
+        "log10": lambda a: sp.log(sp.Abs(a) + eps) / sp.log(sp.Integer(10)),
+        "log2": lambda a: sp.log(sp.Abs(a) + eps) / sp.log(sp.Integer(2)),
+        "exp": lambda a: sp.exp(a),
+        "sin": lambda a: sp.sin(a),
+        "cos": lambda a: sp.cos(a),
+        "tan": lambda a: sp.tan(a),
+        "sinh": lambda a: sp.sinh(a),
+        "cosh": lambda a: sp.cosh(a),
+        "tanh": lambda a: sp.tanh(a),
+        "arcsin": lambda a: sp.asin(a),
+        "arccos": lambda a: sp.acos(a),
+        "arctan": lambda a: sp.atan(a),
+        "arcsinh": lambda a: sp.asinh(a),
+        "arctanh": lambda a: sp.atanh(a),
+        "sigmoid": lambda a: 1 / (1 + sp.exp(-a)),
+    }
+
+
+# Every unary token the evaluators understand (defaults + opt-in extras).
+_SUPPORTED_UNARY_OPS: tuple[str, ...] = tuple(_NUMPY_UNARY)
 _CONST_VALUES: dict[str, float] = {t: float(t) for t in _CONST_TOKENS}
 
 _START_TOKEN = "<s>"  # sentinel fed at step 0
@@ -161,15 +251,12 @@ def _eval_prefix_numpy(
                 return None
             safe_r = np.where(np.abs(r) < 1e-9, np.nan, r)
             return l / safe_r
-        if tok == "square":
+        if tok in _NUMPY_UNARY:
             a = _rec()
-            return None if a is None else a ** 2
-        if tok == "abs":
-            a = _rec()
-            return None if a is None else np.abs(a)
-        if tok == "log":
-            a = _rec()
-            return None if a is None else np.log(np.abs(a) + 1e-10)
+            if a is None:
+                return None
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                return _NUMPY_UNARY[tok](a)
         if tok in arrays:
             return arrays[tok]
         if tok in _CONST_VALUES:
@@ -324,6 +411,7 @@ def _to_sympy_affine(
         return None
 
     pos_ref = [0]
+    umap = _sympy_unary_map(sp)
 
     def _rec() -> Any:
         if pos_ref[0] >= len(tokens):
@@ -343,15 +431,9 @@ def _to_sympy_affine(
                 return l * r
             return l / (r + sp.Float(1e-9))
 
-        if tok == "square":
+        if tok in umap:
             a = _rec()
-            return None if a is None else a ** 2
-        if tok == "abs":
-            a = _rec()
-            return None if a is None else sp.Abs(a)
-        if tok == "log":
-            a = _rec()
-            return None if a is None else sp.log(sp.Abs(a) + sp.Float(1e-10))
+            return None if a is None else umap[tok](a)
 
         if tok in _CONST_VALUES:
             return sp.Float(_CONST_VALUES[tok])
@@ -384,6 +466,7 @@ def _to_sympy(tokens: list[str]) -> tuple[str, Any] | None:
         return None
 
     pos_ref = [0]
+    umap = _sympy_unary_map(sp)
 
     def _rec() -> Any:
         if pos_ref[0] >= len(tokens):
@@ -403,15 +486,9 @@ def _to_sympy(tokens: list[str]) -> tuple[str, Any] | None:
                 return l * r
             return l / (r + sp.Float(1e-9))
 
-        if tok == "square":
+        if tok in umap:
             a = _rec()
-            return None if a is None else a ** 2
-        if tok == "abs":
-            a = _rec()
-            return None if a is None else sp.Abs(a)
-        if tok == "log":
-            a = _rec()
-            return None if a is None else sp.log(sp.Abs(a) + sp.Float(1e-10))
+            return None if a is None else umap[tok](a)
 
         if tok in _CONST_VALUES:
             return sp.Float(_CONST_VALUES[tok])
@@ -696,6 +773,14 @@ class NSREngine:
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.cache_prefix = cache_prefix
         self.binary_ops = tuple(binary_ops) if binary_ops is not None else _BINARY_OPS
+        if unary_ops is not None:
+            unknown = [op for op in unary_ops if op not in _SUPPORTED_UNARY_OPS]
+            if unknown:
+                supported = ", ".join(_SUPPORTED_UNARY_OPS)
+                raise ValueError(
+                    f"unsupported unary op(s): {', '.join(unknown)}. "
+                    f"Supported unary ops: {supported}"
+                )
         self.unary_ops = tuple(unary_ops) if unary_ops is not None else _UNARY_OPS
         self.const_tokens = tuple(const_tokens) if const_tokens is not None else _CONST_TOKENS
         self.device_str = device

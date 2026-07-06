@@ -2,8 +2,9 @@
 
 `nsr-engine` is a Python library for neural symbolic regression. It does not
 require a command-line workflow, but it includes one for running the full
-pipeline end to end. This guide documents the install commands, CLI usage, and
-every public argument exposed by the library.
+pipeline end to end. This guide covers install commands, minimal runs, and the
+Python API. Every command-line input, with its default and available options,
+lives in the separate [CLI reference](cli_reference.md).
 
 ## Install
 
@@ -77,10 +78,11 @@ that formula on held-out rows when SymPy is installed.
 python main.py
 ```
 
-The example wrapper still works:
+The example wrapper and package module entry point are equivalent:
 
 ```bash
 python examples/full_pipeline.py
+python -m nsr_engine.main
 ```
 
 After installation, use:
@@ -109,50 +111,13 @@ all non-target columns are used as features.
 python main.py --input-csv data.csv --target-col y --feature-cols a,b,c
 ```
 
-Show all CLI inputs:
+Every command-line input, with its default and available options (including the
+full menu of unary operators), is documented in the
+[CLI reference](cli_reference.md). To print the same list from the terminal:
 
 ```bash
 python main.py --help
 ```
-
-## Full Pipeline CLI Arguments
-
-The CLI exposes data, split, and engine options.
-
-| Argument | Default | Explanation |
-| --- | --- | --- |
-| `--input-csv` | `None` | Optional CSV file to load instead of generating synthetic data. |
-| `--target-col` | `None` | Target column for `--input-csv`. Required when `--input-csv` is used. |
-| `--feature-cols` | `None` | Comma-separated feature columns. Defaults to all CSV columns except the target. |
-| `--rows` | `3000` | Synthetic row count when `--input-csv` is not used. |
-| `--seed` | `7` | Synthetic data seed and base split seed. |
-| `--train-frac` | `0.8` | Fraction of rows used for `fit`. |
-| `--test-frac` | `0.2` | Fraction of rows used for final held-out evaluation. |
-| `--validation-frac` | `None` | Optional validation fraction. When set, train/test/validation fractions must sum to `1.0`. |
-| `--lambda-grid` | `None` | Comma-separated lambda values. Overrides `--lambdas`, `--lambda-min`, and `--lambda-max`. |
-| `--lambdas`, `--n-lambda` | `10` | Number of lambda values to generate. |
-| `--lambda-min` | `1e-4` | Lower bound for generated lambda grid. |
-| `--lambda-max` | `1e-1` | Upper bound for generated lambda grid. |
-| `--iters`, `--n-iters` | `200` | REINFORCE iterations per lambda. |
-| `--batch-size` | `64` | Expressions sampled per iteration. |
-| `--max-len` | `15` | Maximum prefix token sequence length. |
-| `--elite-frac` | `0.05` | Risk-seeking elite quantile fraction. |
-| `--entropy-weight` | `0.005` | Entropy bonus weight. |
-| `--hidden-dim` | `128` | GRU hidden state size. |
-| `--embed-dim` | `32` | Token embedding size. |
-| `--lr` | `1e-3` | Adam learning rate. |
-| `--random-state` | `None` | Engine random seed. Defaults to `--seed` when omitted. |
-| `--cache-dir` | `None` | Directory for JSON candidate caches. |
-| `--cache-prefix` | `"full_pipeline"` | Cache filename prefix. |
-| `--binary-ops` | engine default | Comma-separated binary operators. |
-| `--unary-ops` | engine default | Comma-separated unary operators. |
-| `--const-tokens` | engine default | Comma-separated constant tokens. |
-| `--device` | `"auto"` | Torch device string such as `"auto"`, `"cpu"`, or `"cuda"`. |
-| `--step-subsample-size` | `None` | Rows used for each training reward calculation. Accepts an integer or `none`. |
-| `--standardize` / `--no-standardize` | `True` | Enable or disable feature z-scoring. |
-| `--affine-reward` / `--no-affine-reward` | `True` | Enable or disable least-squares affine scoring. |
-| `--metric`, `--score-metric` | `"mse"` | Score metric passed to `NSREngine`. |
-| `--prefilter-per-complexity` | `16` | Approximate-score candidates kept per complexity before exact evaluation. |
 
 ## Out-of-Core Run
 
@@ -213,8 +178,8 @@ These are the constructor arguments accepted by `NSREngine(...)`.
 | `random_state` | `42` | Base random seed. Lambda run `i` uses `random_state + i`. |
 | `cache_dir` | `None` | Directory for JSON candidate caches. When set, discovered candidates are saved per lambda and reused on later runs. |
 | `cache_prefix` | `None` | Optional prefix added to cache file names. Useful when sharing one cache directory across experiments. |
-| `binary_ops` | `("+", "-", "*", "/")` | Binary operators available to the expression grammar. |
-| `unary_ops` | `("square", "abs", "log")` | Unary operators available to the expression grammar. |
+| `binary_ops` | `("+", "-", "*", "/")` | Binary operators available to the expression grammar. The four arithmetic operators are the full supported set. |
+| `unary_ops` | `("square", "abs", "log")` | Unary operators available to the expression grammar. Extra operators (`sqrt`, `cbrt`, `exp`, `log10`, `log2`, `sin`, `cos`, `tan`, `sinh`, `cosh`, `tanh`, `arcsin`, `arccos`, `arctan`, `arcsinh`, `arctanh`, `sigmoid`, `neg`, `sign`, `cube`, `reciprocal`) can be opted in. Unknown names raise a `ValueError`. See the [CLI reference](cli_reference.md#unary-operators). |
 | `const_tokens` | `("-1.0", "-0.5", "0.5", "1.0", "2.0")` | Constant terminal tokens available to sampled expressions. Values are parsed with `float(...)`. |
 | `device` | `"auto"` | Torch device. `"auto"` selects CUDA, then Apple MPS, then CPU. You may also pass values such as `"cpu"` or `"cuda"`. |
 | `step_subsample_size` | `None` | Number of rows used for each training iteration reward calculation. For in-memory `fit`, `None` means use all rows. For `fit_memmap`, `None` is treated as `50_000`. |

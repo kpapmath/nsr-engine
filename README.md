@@ -93,6 +93,9 @@ nsr-engine
 nsr-engine --help
 ```
 
+Every command-line input, with its default and available options, is documented
+in the [CLI reference](docs/cli_reference.md).
+
 ## Pipeline case examples
 
 Functional examples for each distinct pipeline path are split into standalone
@@ -115,11 +118,18 @@ The defaults are small CPU-sized smoke examples; increase `--iters`,
 | Type       | Tokens                     |
 |------------|----------------------------|
 | Binary ops | `+ - * /`                  |
-| Unary ops  | `square abs log`           |
+| Unary ops  | `square abs log` (default) |
 | Constants  | `-1.0 -0.5 0.5 1.0 2.0`   |
 | Variables  | column names of input `X`  |
 
 Sequences are in prefix (Polish) notation; the arity-tracking constraint guarantees every sampled sequence is a valid, complete expression tree.
+
+The default unary set is `square`, `abs`, `log`. Many more are available on
+opt-in via `unary_ops=[...]` (or `--unary-ops`): `sqrt`, `cbrt`, `exp`,
+`log10`, `log2`, `sin`, `cos`, `tan`, `sinh`, `cosh`, `tanh`, `arcsin`,
+`arccos`, `arctan`, `arcsinh`, `arctanh`, `sigmoid`, `neg`, `sign`, `cube`, and
+`reciprocal`. See the [CLI reference](docs/cli_reference.md#unary-operators)
+for the full list and each operator's numeric behavior.
 
 ## Out-of-core training
 

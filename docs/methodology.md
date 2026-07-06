@@ -56,6 +56,16 @@ The default vocabulary is:
 | Constants | `-1.0`, `-0.5`, `0.5`, `1.0`, `2.0` | 0 |
 | Start sentinel | `<s>` | internal only |
 
+The unary set is configurable. Beyond the three defaults, a broader menu of
+operators (`sqrt`, `cbrt`, `exp`, `log10`, `log2`, `sin`, `cos`, `tan`, `sinh`,
+`cosh`, `tanh`, `arcsin`, `arccos`, `arctan`, `arcsinh`, `arctanh`, `sigmoid`,
+`neg`, `sign`, `cube`, `reciprocal`) can be enabled with `unary_ops=[...]` or
+`--unary-ops`. See the
+[CLI reference](cli_reference.md#unary-operators) for each operator's numeric
+behavior. Arity, vocabulary ordering, and the sampling masks are all derived
+from the active operator set, so an enabled operator participates in the
+grammar automatically.
+
 Sampling enforces expression validity with an arity budget. The sampler starts
 with one required expression slot. Terminals consume one slot, unary operators
 consume one slot and create one slot, and binary operators consume one slot and
@@ -114,6 +124,12 @@ that are removed from scoring.
 | `square` | Elementwise square. |
 | `abs` | Elementwise absolute value. |
 | `log` | `log(abs(x) + 1e-10)`. |
+
+The table above lists the default unary operators. Opt-in operators follow the
+same NaN-safe convention: restricted-domain operators guard their input (for
+example `sqrt(abs(x))` and `arcsin(clip(x, -1, 1))`) and overflow-prone
+operators convert non-finite results to NaN. The full behavior table is in the
+[CLI reference](cli_reference.md#unary-operators).
 
 Candidates need at least two finite aligned prediction and target values to be
 scored.
