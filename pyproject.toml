@@ -53,5 +53,8 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+nsr_engine = ["py.typed"]
+
 [tool.setuptools.dynamic]
 version = { attr = "nsr_engine.__version__" }
