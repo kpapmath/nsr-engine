@@ -3,4 +3,4 @@ from nsr_engine.pareto import ParetoFront, ParetoPoint
 from nsr_engine.base import SREngine
 
 __all__ = ["NSREngine", "ParetoFront", "ParetoPoint", "SREngine"]
-__version__ = "0.1.1"
+__version__ = "0.2.0"

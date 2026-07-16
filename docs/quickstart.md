@@ -69,9 +69,8 @@ print("elbow formula:", front.elbow().equation)
 A complete runnable pipeline is available from the repository root as
 `main.py`, from the package as `python -m nsr_engine.main`, and after
 installation as the `nsr-engine` command. It can generate synthetic data or
-load a CSV, split train/test rows with optional validation rows, train the
-lambda sweep, print the Pareto front, select the elbow formula, and evaluate
-that formula on held-out rows when SymPy is installed.
+load a CSV, optionally run holdout, K-fold, or time-series validation, train the
+lambda sweep, print the Pareto front, and select the elbow formula.
 
 ```bash
 python main.py
@@ -89,11 +88,29 @@ After installation, use:
 nsr-engine
 ```
 
-By default the pipeline uses `--train-frac 0.8 --test-frac 0.2`. Add
-`--validation-frac` to use train/test/validation splits:
+By default the pipeline uses `--validation-mode none`, which fits the final
+Pareto front on the entire dataset. Add `--validation-mode sequential` for a
+single chronological train/test split:
 
 ```bash
-python main.py --train-frac 0.7 --test-frac 0.2 --validation-frac 0.1
+python main.py --validation-mode sequential --train-frac 0.8 --test-frac 0.2
+```
+
+Add `--validation-frac` with `sequential` or `holdout` to use
+train/validation/test splits:
+
+```bash
+python main.py --validation-mode sequential --train-frac 0.7 --validation-frac 0.1 --test-frac 0.2
+```
+
+K-fold, expanding-window, walk-forward, and blocked time-series validation are
+also available:
+
+```bash
+python main.py --validation-mode k-fold --folds 5
+python main.py --validation-mode expanding-window --folds 5
+python main.py --validation-mode walk-forward --folds 5
+python main.py --validation-mode blocked-time-series --folds 5
 ```
 
 Use smaller settings for a fast smoke run:
@@ -126,9 +143,12 @@ The CLI exposes data, split, and engine options.
 | `--feature-cols` | `None` | Comma-separated feature columns. Defaults to all CSV columns except the target. |
 | `--rows` | `3000` | Synthetic row count when `--input-csv` is not used. |
 | `--seed` | `7` | Synthetic data seed and base split seed. |
-| `--train-frac` | `0.8` | Fraction of rows used for `fit`. |
-| `--test-frac` | `0.2` | Fraction of rows used for final held-out evaluation. |
-| `--validation-frac` | `None` | Optional validation fraction. When set, train/test/validation fractions must sum to `1.0`. |
+| `--validation-mode` | `"none"` | Validation strategy: `none`, `sequential`, `holdout`, `k-fold`, `expanding-window`, `walk-forward`, or `blocked-time-series`. |
+| `--train-frac` | `0.8` | Fraction of rows used for `fit` in `sequential` or `holdout` mode. |
+| `--test-frac` | `0.2` | Fraction of rows used for held-out test evaluation in `sequential` or `holdout` mode. |
+| `--validation-frac` | `None` | Optional validation fraction for `sequential` or `holdout` mode. When set, train/test/validation fractions must sum to `1.0`. |
+| `--folds` | `5` | Number of folds for `k-fold`, `expanding-window`, `walk-forward`, or `blocked-time-series` validation. |
+| `--shuffle` / `--no-shuffle` | `False` | Shuffle rows for `holdout` and `k-fold` validation. `sequential` and time-series modes preserve row order. |
 | `--lambda-grid` | `None` | Comma-separated lambda values. Overrides `--lambdas`, `--lambda-min`, and `--lambda-max`. |
 | `--lambdas`, `--n-lambda` | `10` | Number of lambda values to generate. |
 | `--lambda-min` | `1e-4` | Lower bound for generated lambda grid. |
@@ -153,6 +173,18 @@ The CLI exposes data, split, and engine options.
 | `--affine-reward` / `--no-affine-reward` | `True` | Enable or disable least-squares affine scoring. |
 | `--metric`, `--score-metric` | `"mse"` | Score metric passed to `NSREngine`. |
 | `--prefilter-per-complexity` | `16` | Approximate-score candidates kept per complexity before exact evaluation. |
+
+Validation modes:
+
+| Mode | Behavior |
+| --- | --- |
+| `none` | Fit the final Pareto front on all rows. This is the default. |
+| `sequential` | Chronological single train/test split; past rows train, immediately subsequent rows test. |
+| `holdout` | Single train/test split like `sequential`, but may be randomized with `--shuffle`. |
+| `k-fold` | K-fold validation; folds are ordered by default and randomized only with `--shuffle`. |
+| `expanding-window` | Expanding-window time-series validation; each fold adds more historical rows to training. |
+| `walk-forward` | Walk-forward mode using the same expanding training window behavior. |
+| `blocked-time-series` | Contiguous non-overlapping train/validation blocks; each validation block immediately follows its training block. |
 
 ## Out-of-Core Run
 
