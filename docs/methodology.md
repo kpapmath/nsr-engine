@@ -77,15 +77,11 @@ The default vocabulary is:
 | Constants | `-1.0`, `-0.5`, `0.5`, `1.0`, `2.0` | 0 |
 | Start sentinel | `<s>` | internal only |
 
-The unary set is configurable. Beyond the three defaults, a broader menu of
-operators (`sqrt`, `cbrt`, `exp`, `log10`, `log2`, `sin`, `cos`, `tan`, `sinh`,
-`cosh`, `tanh`, `arcsin`, `arccos`, `arctan`, `arcsinh`, `arctanh`, `sigmoid`,
-`neg`, `sign`, `cube`, `reciprocal`) can be enabled with `unary_ops=[...]` or
-`--unary-ops`. See the
-[CLI reference](cli_reference.md#unary-operators) for each operator's numeric
-behavior. Arity, vocabulary ordering, and the sampling masks are all derived
-from the active operator set, so an enabled operator participates in the
-grammar automatically.
+The unary set is configurable. Beyond the three defaults, all unary functions
+listed under [Numeric Evaluation](#numeric-evaluation) can be enabled with
+`unary_ops=[...]` or `--unary-ops`. Arity, vocabulary ordering, and the
+sampling masks are all derived from the active operator set, so an enabled
+operator participates in the grammar automatically.
 
 Sampling enforces expression validity with an arity budget. The sampler starts
 with one required expression slot. Terminals consume one slot, unary operators
@@ -137,20 +133,58 @@ The training evaluator walks the prefix tokens recursively and produces a
 prediction vector. Invalid operations do not crash the run; they produce NaNs
 that are removed from scoring.
 
-| Operator | Numeric behavior |
-| --- | --- |
-| `+`, `-` | Elementwise addition and subtraction. |
-| `*` | Elementwise multiplication with non-finite products converted to NaN. |
-| `/` | Elementwise division with denominators smaller than `1e-9` treated as NaN. |
-| `square` | Elementwise square. |
-| `abs` | Elementwise absolute value. |
-| `log` | `log(abs(x) + 1e-10)`. |
+### Binary functions
 
-The table above lists the default unary operators. Opt-in operators follow the
-same NaN-safe convention: restricted-domain operators guard their input (for
-example `sqrt(abs(x))` and `arcsin(clip(x, -1, 1))`) and overflow-prone
-operators convert non-finite results to NaN. The full behavior table is in the
-[CLI reference](cli_reference.md#unary-operators).
+| Token | Numeric behavior |
+| --- | --- |
+| `+` | Elementwise addition. |
+| `-` | Elementwise subtraction. |
+| `*` | Elementwise multiplication; non-finite products become NaN. |
+| `/` | Elementwise division; denominator values with `abs(x) < 1e-9` become NaN. |
+
+These four binary functions are the complete binary function library. They are
+enabled by default and can be selected with `binary_ops` or `--binary-ops`.
+
+### Unary functions
+
+| Token | Availability | Numeric behavior |
+| --- | --- | --- |
+| `square` | Default | `x ** 2` |
+| `abs` | Default | `abs(x)` |
+| `log` | Default | `log(abs(x) + 1e-10)` |
+| `cube` | Opt-in | `x ** 3`; non-finite results become NaN. |
+| `neg` | Opt-in | `-x` |
+| `sign` | Opt-in | `sign(x)` |
+| `sqrt` | Opt-in | `sqrt(abs(x))` |
+| `cbrt` | Opt-in | Signed cube root of `x`. |
+| `reciprocal` | Opt-in | `1 / x`; inputs with `abs(x) < 1e-9` become NaN. |
+| `log10` | Opt-in | `log10(abs(x) + 1e-10)` |
+| `log2` | Opt-in | `log2(abs(x) + 1e-10)` |
+| `exp` | Opt-in | `exp(x)`; overflow becomes NaN. |
+| `sin` | Opt-in | `sin(x)` |
+| `cos` | Opt-in | `cos(x)` |
+| `tan` | Opt-in | `tan(x)`; non-finite results become NaN. |
+| `sinh` | Opt-in | `sinh(x)`; overflow becomes NaN. |
+| `cosh` | Opt-in | `cosh(x)`; overflow becomes NaN. |
+| `tanh` | Opt-in | `tanh(x)` |
+| `arcsin` | Opt-in | `arcsin(clip(x, -1, 1))` |
+| `arccos` | Opt-in | `arccos(clip(x, -1, 1))` |
+| `arctan` | Opt-in | `arctan(x)` |
+| `arcsinh` | Opt-in | `arcsinh(x)` |
+| `arctanh` | Opt-in | `arctanh(clip(x, -1 + 1e-7, 1 - 1e-7))` |
+| `sigmoid` | Opt-in | `1 / (1 + exp(-clip(x, -50, 50)))` |
+
+This is the complete unary function library understood by the evaluator. The
+opt-in functions are available through `NSREngine(unary_ops=[...])` and
+`--unary-ops`. Restricted-domain functions guard or transform their inputs,
+and overflow-prone functions convert non-finite results to NaN.
+
+### Terminal functions
+
+Feature-column tokens return the corresponding input vector. Constant tokens
+return a vector filled with that value. The defaults are `-1.0`, `-0.5`,
+`0.5`, `1.0`, and `2.0`; `const_tokens` or `--const-tokens` can replace them
+with any values parseable as floating-point numbers.
 
 Candidates need at least two finite aligned prediction and target values to be
 scored.
