@@ -5,10 +5,15 @@ import pandas as pd
 import pytest
 
 from nsr_engine import NSREngine, ParetoFront
-from examples.full_pipeline import (
+from nsr_engine.pipeline import (
+    blocked_time_series_splits,
+    expanding_window_splits,
+    k_fold_splits,
     train_test_validation_split,
     validate_split_fractions,
+    walk_forward_splits,
 )
+from nsr_engine.main import parse_args
 
 
 def _make_data(n: int = 300, seed: int = 0) -> tuple[pd.DataFrame, pd.Series]:
@@ -88,8 +93,31 @@ def test_train_test_split_defaults_without_validation():
     assert len(y_train) == 8
     assert len(X_test) == 2
     assert len(y_test) == 2
+    assert X_train.index.tolist() == list(range(8))
+    assert X_train["a"].tolist() == X["a"].iloc[:8].tolist()
+    assert X_test["a"].tolist() == X["a"].iloc[8:].tolist()
     assert X_validation is None
     assert y_validation is None
+
+
+def test_train_test_split_can_shuffle():
+    X, y = _make_data(n=10)
+
+    X_train, X_test, _, y_train, y_test, _ = train_test_validation_split(
+        X,
+        y,
+        train_frac=0.8,
+        test_frac=0.2,
+        validation_frac=None,
+        seed=1,
+        shuffle=True,
+    )
+
+    assert len(X_train) == 8
+    assert len(y_train) == 8
+    assert len(X_test) == 2
+    assert len(y_test) == 2
+    assert X_train["a"].tolist() != X["a"].iloc[:8].tolist()
 
 
 def test_train_test_validation_split():
@@ -114,6 +142,105 @@ def test_train_test_validation_split():
     assert y_validation is not None
     assert len(X_validation) == 1
     assert len(y_validation) == 1
+    assert X_train["a"].tolist() == X["a"].iloc[:7].tolist()
+    assert X_validation["a"].tolist() == X["a"].iloc[7:8].tolist()
+    assert X_test["a"].tolist() == X["a"].iloc[8:].tolist()
+
+
+def test_k_fold_splits_preserve_order_by_default():
+    X, y = _make_data(n=10)
+
+    folds = list(k_fold_splits(X, y, n_splits=5, seed=1))
+
+    assert len(folds) == 5
+    assert folds[0].name == "k_fold_1"
+    assert folds[0].X_eval["a"].tolist() == X["a"].iloc[:2].tolist()
+    assert folds[-1].X_eval["a"].tolist() == X["a"].iloc[8:].tolist()
+    assert len(folds[0].X_train) == 8
+    assert len(folds[0].y_train) == 8
+    assert len(folds[0].y_eval) == 2
+
+
+def test_k_fold_splits_can_shuffle():
+    X, y = _make_data(n=10)
+
+    folds = list(k_fold_splits(X, y, n_splits=5, seed=1, shuffle=True))
+
+    assert len(folds) == 5
+    assert folds[0].X_eval["a"].tolist() != X["a"].iloc[:2].tolist()
+
+
+def test_walk_forward_splits_expand_training_window():
+    X, y = _make_data(n=10)
+
+    folds = list(walk_forward_splits(X, y, n_splits=4))
+
+    assert len(folds) == 4
+    assert folds[0].name == "walk_forward_1"
+    assert folds[0].X_train["a"].tolist() == X["a"].iloc[:2].tolist()
+    assert folds[0].X_eval["a"].tolist() == X["a"].iloc[2:4].tolist()
+    assert folds[1].X_train["a"].tolist() == X["a"].iloc[:4].tolist()
+    assert folds[-1].X_eval["a"].tolist() == X["a"].iloc[8:].tolist()
+
+
+def test_expanding_window_splits_use_explicit_name():
+    X, y = _make_data(n=10)
+
+    folds = list(expanding_window_splits(X, y, n_splits=4))
+
+    assert len(folds) == 4
+    assert folds[0].name == "expanding_window_1"
+    assert folds[1].X_train["a"].tolist() == X["a"].iloc[:4].tolist()
+
+
+def test_blocked_time_series_splits_use_adjacent_blocks():
+    X, y = _make_data(n=10)
+
+    folds = list(blocked_time_series_splits(X, y, n_splits=4))
+
+    assert len(folds) == 4
+    assert folds[0].name == "blocked_time_series_1"
+    assert folds[0].X_train["a"].tolist() == X["a"].iloc[:2].tolist()
+    assert folds[0].X_eval["a"].tolist() == X["a"].iloc[2:4].tolist()
+    assert folds[1].X_train["a"].tolist() == X["a"].iloc[2:4].tolist()
+    assert folds[1].X_eval["a"].tolist() == X["a"].iloc[4:6].tolist()
+    assert folds[-1].X_eval["a"].tolist() == X["a"].iloc[8:].tolist()
+
+
+def test_cli_validation_mode_defaults_to_none(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["nsr-engine"])
+
+    args = parse_args()
+
+    assert args.validation_mode == "none"
+
+
+def test_cli_accepts_kfold_alias(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["nsr-engine", "--validation-mode", "kfold"])
+
+    args = parse_args()
+
+    assert args.validation_mode == "k-fold"
+
+
+@pytest.mark.parametrize(
+    ("raw_mode", "expected"),
+    [
+        ("sequential-train-test", "sequential"),
+        ("expanding", "expanding-window"),
+        ("blocked", "blocked-time-series"),
+    ],
+)
+def test_cli_accepts_time_series_validation_aliases(
+    monkeypatch,
+    raw_mode,
+    expected,
+):
+    monkeypatch.setattr("sys.argv", ["nsr-engine", "--validation-mode", raw_mode])
+
+    args = parse_args()
+
+    assert args.validation_mode == expected
 
 
 def test_split_fraction_range_validation():

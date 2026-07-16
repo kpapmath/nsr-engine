@@ -3,9 +3,22 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+
+
+@dataclass(frozen=True)
+class ValidationFold:
+    """One train/evaluation split for validation workflows."""
+
+    name: str
+    X_train: pd.DataFrame
+    X_eval: pd.DataFrame
+    y_train: pd.Series
+    y_eval: pd.Series
 
 
 def make_dataset(rows: int, seed: int) -> tuple[pd.DataFrame, pd.Series]:
@@ -74,6 +87,142 @@ def validate_split_fractions(
         )
 
 
+def _split_indices(
+    X: pd.DataFrame,
+    y: pd.Series,
+    train_idx: np.ndarray,
+    eval_idx: np.ndarray,
+    *,
+    name: str,
+) -> ValidationFold:
+    return ValidationFold(
+        name=name,
+        X_train=X.iloc[train_idx].reset_index(drop=True),
+        X_eval=X.iloc[eval_idx].reset_index(drop=True),
+        y_train=y.iloc[train_idx].reset_index(drop=True),
+        y_eval=y.iloc[eval_idx].reset_index(drop=True),
+    )
+
+
+def _validate_n_splits(n_splits: int, n_rows: int) -> None:
+    if n_splits < 2:
+        raise ValueError("n_splits must be at least 2.")
+    if n_splits > n_rows:
+        raise ValueError(
+            f"n_splits must be <= number of rows ({n_rows}), got {n_splits}."
+        )
+
+
+def k_fold_splits(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    n_splits: int,
+    seed: int,
+    shuffle: bool = False,
+) -> Iterator[ValidationFold]:
+    """Yield K-fold validation splits.
+
+    Rows are assigned to folds in order by default. Set ``shuffle=True`` to
+    randomize fold assignment with ``seed``.
+    """
+    _validate_n_splits(n_splits, len(X))
+
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        idx = rng.permutation(len(X))
+    else:
+        idx = np.arange(len(X))
+
+    folds = np.array_split(idx, n_splits)
+    all_idx = np.arange(len(X))
+    for fold_number, eval_idx in enumerate(folds, start=1):
+        train_idx = np.setdiff1d(all_idx, eval_idx, assume_unique=False)
+        yield _split_indices(
+            X,
+            y,
+            train_idx,
+            eval_idx,
+            name=f"k_fold_{fold_number}",
+        )
+
+
+def expanding_window_splits(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    n_splits: int,
+    name_prefix: str = "expanding_window",
+) -> Iterator[ValidationFold]:
+    """Yield expanding-window validation splits."""
+    if n_splits < 1:
+        raise ValueError("n_splits must be at least 1.")
+    if n_splits >= len(X):
+        raise ValueError(
+            f"n_splits must be < number of rows ({len(X)}), got {n_splits}."
+        )
+
+    idx = np.arange(len(X))
+    blocks = np.array_split(idx, n_splits + 1)
+    for fold_number in range(1, len(blocks)):
+        train_idx = np.concatenate(blocks[:fold_number])
+        eval_idx = blocks[fold_number]
+        if len(train_idx) == 0 or len(eval_idx) == 0:
+            continue
+        yield _split_indices(
+            X,
+            y,
+            train_idx,
+            eval_idx,
+            name=f"{name_prefix}_{fold_number}",
+        )
+
+
+def walk_forward_splits(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    n_splits: int,
+) -> Iterator[ValidationFold]:
+    """Yield expanding-window walk-forward validation splits."""
+    yield from expanding_window_splits(
+        X,
+        y,
+        n_splits=n_splits,
+        name_prefix="walk_forward",
+    )
+
+
+def blocked_time_series_splits(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    n_splits: int,
+) -> Iterator[ValidationFold]:
+    """Yield blocked time-series splits with adjacent train/eval blocks."""
+    if n_splits < 1:
+        raise ValueError("n_splits must be at least 1.")
+    if n_splits >= len(X):
+        raise ValueError(
+            f"n_splits must be < number of rows ({len(X)}), got {n_splits}."
+        )
+
+    idx = np.arange(len(X))
+    blocks = np.array_split(idx, n_splits + 1)
+    for fold_number in range(n_splits):
+        train_idx = blocks[fold_number]
+        eval_idx = blocks[fold_number + 1]
+        if len(train_idx) == 0 or len(eval_idx) == 0:
+            continue
+        yield _split_indices(
+            X,
+            y,
+            train_idx,
+            eval_idx,
+            name=f"blocked_time_series_{fold_number + 1}",
+        )
+
+
 def train_test_validation_split(
     X: pd.DataFrame,
     y: pd.Series,
@@ -82,6 +231,7 @@ def train_test_validation_split(
     test_frac: float,
     validation_frac: float | None,
     seed: int,
+    shuffle: bool = False,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -92,8 +242,11 @@ def train_test_validation_split(
 ]:
     validate_split_fractions(train_frac, test_frac, validation_frac)
 
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(X))
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        idx = rng.permutation(len(X))
+    else:
+        idx = np.arange(len(X))
     train_end = int(train_frac * len(X))
 
     if validation_frac is None:

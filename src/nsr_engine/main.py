@@ -7,11 +7,15 @@ from pathlib import Path
 
 from nsr_engine import NSREngine
 from nsr_engine.pipeline import (
+    blocked_time_series_splits,
     evaluate_with_sympy,
+    expanding_window_splits,
+    k_fold_splits,
     load_csv_dataset,
     make_dataset,
     train_test_validation_split,
     validate_split_fractions,
+    walk_forward_splits,
 )
 
 
@@ -27,6 +31,41 @@ def _none_or_int(value: str) -> int | None:
     if value.lower() in {"none", "null"}:
         return None
     return int(value)
+
+
+def _validation_mode(value: str) -> str:
+    normalized = value.lower().replace("_", "-")
+    aliases = {
+        "kfold": "k-fold",
+        "k-fold": "k-fold",
+        "blocked": "blocked-time-series",
+        "blocked-time-series": "blocked-time-series",
+        "blocked-timeseries": "blocked-time-series",
+        "blocked-time": "blocked-time-series",
+        "expanding": "expanding-window",
+        "expanding-window": "expanding-window",
+        "expandingwindow": "expanding-window",
+        "walkforward": "walk-forward",
+        "walk-forward": "walk-forward",
+        "none": "none",
+        "holdout": "holdout",
+        "sequential": "sequential",
+        "sequential-train-test": "sequential",
+    }
+    if normalized not in aliases:
+        valid = ", ".join(
+            [
+                "none",
+                "sequential",
+                "holdout",
+                "k-fold",
+                "expanding-window",
+                "walk-forward",
+                "blocked-time-series",
+            ]
+        )
+        raise argparse.ArgumentTypeError(f"invalid validation mode: {value}. Use {valid}.")
+    return aliases[normalized]
 
 
 def _add_bool_arg(
@@ -69,9 +108,35 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--seed", type=int, default=7)
 
     split = parser.add_argument_group("split")
+    split.add_argument(
+        "--validation-mode",
+        type=_validation_mode,
+        default="none",
+        help=(
+            "Validation strategy: none, sequential, holdout, k-fold, "
+            "expanding-window, walk-forward, or blocked-time-series. "
+            "Default uses the entire dataset for the final fit."
+        ),
+    )
     split.add_argument("--train-frac", type=float, default=0.8)
     split.add_argument("--test-frac", type=float, default=0.2)
     split.add_argument("--validation-frac", type=float, default=None)
+    split.add_argument(
+        "--folds",
+        type=int,
+        default=5,
+        help=(
+            "Number of folds for k-fold, expanding-window, walk-forward, "
+            "or blocked-time-series validation."
+        ),
+    )
+    _add_bool_arg(
+        split,
+        "shuffle",
+        default=False,
+        help_text="Shuffle rows before splitting.",
+        disable_help_text="Preserve row order when splitting.",
+    )
 
     engine = parser.add_argument_group("engine")
     engine.add_argument(
@@ -126,38 +191,33 @@ def parse_args() -> argparse.Namespace:
     if args.input_csv is not None and args.target_col is None:
         parser.error("--target-col is required when --input-csv is provided")
 
-    try:
-        validate_split_fractions(args.train_frac, args.test_frac, args.validation_frac)
-    except ValueError as exc:
-        parser.error(str(exc))
+    if args.validation_mode in {"holdout", "sequential"}:
+        try:
+            validate_split_fractions(
+                args.train_frac, args.test_frac, args.validation_frac
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.validation_frac is not None:
+        parser.error(
+            "--validation-frac is only used with --validation-mode sequential or holdout"
+        )
+
+    if (
+        args.validation_mode
+        in {"k-fold", "expanding-window", "walk-forward", "blocked-time-series"}
+        and args.folds < 2
+    ):
+        parser.error(
+            "--folds must be at least 2 for k-fold, expanding-window, "
+            "walk-forward, or blocked-time-series validation"
+        )
 
     return args
 
 
-def main() -> None:
-    args = parse_args()
-
-    if args.input_csv is None:
-        X, y = make_dataset(args.rows, args.seed)
-    else:
-        X, y = load_csv_dataset(
-            str(args.input_csv),
-            target_col=args.target_col,
-            feature_cols=args.feature_cols,
-        )
-
-    X_train, X_test, X_validation, y_train, y_test, y_validation = (
-        train_test_validation_split(
-            X,
-            y,
-            train_frac=args.train_frac,
-            test_frac=args.test_frac,
-            validation_frac=args.validation_frac,
-            seed=args.seed + 1,
-        )
-    )
-
-    engine = NSREngine(
+def _build_engine(args: argparse.Namespace, *, cache_prefix: str | None = None) -> NSREngine:
+    return NSREngine(
         lambda_grid=args.lambda_grid,
         n_lambda=args.n_lambda,
         lambda_min=args.lambda_min,
@@ -172,7 +232,7 @@ def main() -> None:
         lr=args.lr,
         random_state=args.seed if args.random_state is None else args.random_state,
         cache_dir=args.cache_dir,
-        cache_prefix=args.cache_prefix,
+        cache_prefix=args.cache_prefix if cache_prefix is None else cache_prefix,
         binary_ops=args.binary_ops,
         unary_ops=args.unary_ops,
         const_tokens=args.const_tokens,
@@ -184,31 +244,107 @@ def main() -> None:
         prefilter_per_complexity=args.prefilter_per_complexity,
     )
 
-    front = engine.fit(X_train, y_train)
+
+def _print_selected_front(front, *, title: str) -> object:
     if len(front) == 0:
         raise RuntimeError(
             "No valid expressions were discovered. Increase --iters or --max-len."
         )
 
     frame = front.to_frame()
-    print("\nPareto front")
+    print(f"\n{title}")
     print(frame.to_string(index=False))
 
     selected = front.elbow()
     print("\nSelected elbow formula")
     print(selected.equation)
     print(f"complexity={selected.complexity} score_metric={selected.score_metric}")
+    return selected
 
-    if X_validation is not None and y_validation is not None:
-        validation_rmse = evaluate_with_sympy(
-            selected.sympy_expr, X_validation, y_validation
+
+def _run_validation_folds(args: argparse.Namespace, X, y) -> None:
+    if args.validation_mode == "k-fold":
+        folds = list(
+            k_fold_splits(
+                X,
+                y,
+                n_splits=args.folds,
+                seed=args.seed + 1,
+                shuffle=args.shuffle,
+            )
         )
-        if validation_rmse is not None:
-            print(f"validation_rmse={validation_rmse:.6f}")
+    elif args.validation_mode == "expanding-window":
+        folds = list(expanding_window_splits(X, y, n_splits=args.folds))
+    elif args.validation_mode == "walk-forward":
+        folds = list(walk_forward_splits(X, y, n_splits=args.folds))
+    elif args.validation_mode == "blocked-time-series":
+        folds = list(blocked_time_series_splits(X, y, n_splits=args.folds))
+    else:
+        return
 
-    test_rmse = evaluate_with_sympy(selected.sympy_expr, X_test, y_test)
-    if test_rmse is not None:
-        print(f"test_rmse={test_rmse:.6f}")
+    fold_rmses: list[float] = []
+    print(f"\n{args.validation_mode} validation")
+    for fold in folds:
+        engine = _build_engine(args, cache_prefix=f"{args.cache_prefix}_{fold.name}")
+        front = engine.fit(fold.X_train, fold.y_train)
+        if len(front) == 0:
+            print(f"{fold.name}_rmse=nan")
+            continue
+        selected = front.elbow()
+        fold_rmse = evaluate_with_sympy(selected.sympy_expr, fold.X_eval, fold.y_eval)
+        if fold_rmse is not None:
+            fold_rmses.append(fold_rmse)
+            print(f"{fold.name}_rmse={fold_rmse:.6f}")
+
+    if fold_rmses:
+        mean_rmse = sum(fold_rmses) / len(fold_rmses)
+        print(f"mean_validation_rmse={mean_rmse:.6f}")
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.input_csv is None:
+        X, y = make_dataset(args.rows, args.seed)
+    else:
+        X, y = load_csv_dataset(
+            str(args.input_csv),
+            target_col=args.target_col,
+            feature_cols=args.feature_cols,
+        )
+
+    if args.validation_mode in {"holdout", "sequential"}:
+        split_shuffle = args.shuffle and args.validation_mode == "holdout"
+        X_train, X_test, X_validation, y_train, y_test, y_validation = (
+            train_test_validation_split(
+                X,
+                y,
+                train_frac=args.train_frac,
+                test_frac=args.test_frac,
+                validation_frac=args.validation_frac,
+                seed=args.seed + 1,
+                shuffle=split_shuffle,
+            )
+        )
+        front = _build_engine(args).fit(X_train, y_train)
+        selected = _print_selected_front(front, title="Pareto front")
+
+        if X_validation is not None and y_validation is not None:
+            validation_rmse = evaluate_with_sympy(
+                selected.sympy_expr, X_validation, y_validation
+            )
+            if validation_rmse is not None:
+                print(f"validation_rmse={validation_rmse:.6f}")
+
+        test_rmse = evaluate_with_sympy(selected.sympy_expr, X_test, y_test)
+        if test_rmse is not None:
+            print(f"test_rmse={test_rmse:.6f}")
+        return
+
+    _run_validation_folds(args, X, y)
+
+    front = _build_engine(args).fit(X, y)
+    _print_selected_front(front, title="Pareto front")
 
 
 if __name__ == "__main__":

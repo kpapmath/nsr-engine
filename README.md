@@ -51,9 +51,8 @@ print("elbow formula:", front.elbow().equation)
 ## Full pipeline example
 
 The repository includes a runnable end-to-end pipeline that generates data or
-loads a CSV, splits train/test rows with optional validation rows, trains the
-engine, prints the Pareto front, selects the elbow formula, and evaluates it on
-held-out rows when SymPy is installed.
+loads a CSV, optionally runs holdout, K-fold, or time-series validation, trains
+the engine, prints the Pareto front, and selects the elbow formula.
 
 ```bash
 python main.py
@@ -66,12 +65,35 @@ python examples/full_pipeline.py
 python -m nsr_engine.main
 ```
 
-By default the example uses `--train-frac 0.8 --test-frac 0.2`. Add
-`--validation-frac` to use train/test/validation splits, for example:
+By default the example uses the entire dataset for the final fit
+(`--validation-mode none`). Add `--validation-mode sequential` for a single
+chronological train/test split:
 
 ```bash
-python main.py --train-frac 0.7 --test-frac 0.2 --validation-frac 0.1
+python main.py --validation-mode sequential --train-frac 0.8 --test-frac 0.2
 ```
+
+K-fold, expanding-window, walk-forward, and blocked time-series validation are
+also available:
+
+```bash
+python main.py --validation-mode k-fold --folds 5
+python main.py --validation-mode expanding-window --folds 5
+python main.py --validation-mode walk-forward --folds 5
+python main.py --validation-mode blocked-time-series --folds 5
+```
+
+Validation modes:
+
+| Mode | Behavior |
+| --- | --- |
+| `none` | Fit the final Pareto front on all rows. This is the default. |
+| `sequential` | Chronological single train/test split; past rows train, immediately subsequent rows test. |
+| `holdout` | Single train/test split like `sequential`, but may be randomized with `--shuffle`. |
+| `k-fold` | K-fold validation; folds are ordered by default and randomized only with `--shuffle`. |
+| `expanding-window` | Expanding-window time-series validation; each fold adds more historical rows to training. |
+| `walk-forward` | Alias-style walk-forward mode using the same expanding training window behavior. |
+| `blocked-time-series` | Contiguous non-overlapping train/validation blocks; each validation block immediately follows its training block. |
 
 For a quicker smoke run:
 

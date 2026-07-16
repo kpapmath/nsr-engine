@@ -31,6 +31,27 @@ The method is designed to keep training fast: expression scoring uses NumPy
 arrays and float32 feature buffers, while SymPy conversion is deferred until
 after training and exact evaluation have reduced the candidate set.
 
+## Validation Workflows
+
+The engine itself fits whatever rows are passed to `fit`. The full pipeline CLI
+adds optional validation workflows around that fit. By default
+(`--validation-mode none`), no rows are held out and the final Pareto front is
+fit on the entire dataset.
+
+| Mode | Workflow | Time-order guarantee |
+| --- | --- | --- |
+| `none` | Fit once on all rows. | Uses all rows, no held-out evaluation. |
+| `sequential` | One chronological train/test split. | Past rows train, immediately subsequent rows test. |
+| `holdout` | One train/test split, optionally randomized with `--shuffle`. | Ordered unless `--shuffle` is set. |
+| `k-fold` | Partition rows into K folds and evaluate each fold once. | Ordered by default; randomized only with `--shuffle`. |
+| `expanding-window` | Repeated folds where the training window grows forward through time. | Future rows are never included in a fold's training set. |
+| `walk-forward` | Walk-forward validation using the same expanding-window mechanics. | Future rows are never included in a fold's training set. |
+| `blocked-time-series` | Adjacent non-overlapping train/validation blocks. | Each validation block immediately follows its training block. |
+
+For K-fold, expanding-window, walk-forward, and blocked time-series validation,
+the CLI reports fold RMSE values and their mean, then fits the final reported
+Pareto front on the full dataset.
+
 ## Expression Representation
 
 Expressions are sampled as prefix, also called Polish notation, token

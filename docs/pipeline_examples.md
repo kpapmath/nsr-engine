@@ -19,13 +19,27 @@ All scripts accept the same basic sizing arguments:
 ```
 
 Increase `--iters`, `--lambdas`, and `--rows` for stronger searches.
+The full pipeline CLI uses the entire dataset by default
+(`--validation-mode none`). Use `--validation-mode sequential`, `holdout`,
+`k-fold`, `expanding-window`, `walk-forward`, or `blocked-time-series` when
+held-out validation is desired.
+
+```bash
+python main.py --validation-mode sequential --train-frac 0.8 --test-frac 0.2
+python main.py --validation-mode k-fold --folds 5
+python main.py --validation-mode expanding-window --folds 5
+python main.py --validation-mode blocked-time-series --folds 5
+```
+
+The standalone example scripts below demonstrate fixed pipeline paths. Use the
+full CLI when you want to switch validation strategies from the command line.
 
 ## Cases
 
 | Script | Pipeline case | What it demonstrates |
 |--------|---------------|----------------------|
-| `examples/generated_train_test.py` | Generated data, train/test | Builds synthetic data with `make_dataset`, splits 80/20, fits `NSREngine`, prints the Pareto front, selects the elbow formula, and reports test RMSE when SymPy is available. |
-| `examples/generated_validation.py` | Generated data, train/test/validation | Uses a 70/20/10 split and reports validation RMSE plus test RMSE for the selected formula. |
+| `examples/generated_train_test.py` | Generated data, train/test | Builds synthetic data with `make_dataset`, splits rows 80/20 in order, fits `NSREngine`, prints the Pareto front, selects the elbow formula, and reports test RMSE when SymPy is available. |
+| `examples/generated_validation.py` | Generated data, train/test/validation | Uses an ordered 70/10/20 train/validation/test split and reports validation RMSE plus test RMSE for the selected formula. |
 | `examples/csv_input.py` | CSV input | Creates a temporary CSV, loads it through `load_csv_dataset`, selects explicit feature columns, and evaluates the selected formula on held-out rows. |
 | `examples/custom_metric_library.py` | Custom engine configuration | Uses `score_metric="mae"` with a reduced binary, unary, and constant token library. |
 | `examples/cached_run.py` | Cache reuse | Runs two fits against the same temporary cache directory so the second run loads cached lambda candidates. |
