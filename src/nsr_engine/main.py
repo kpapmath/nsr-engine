@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import functools
 from pathlib import Path
 
-from nsr_engine import NSREngine
+from nsr_engine import (
+    NSREngine,
+    ParetoFront,
+    ParetoPoint,
+    ResidualBoostedNSR,
+    joint_refit_prune,
+    optimize_constants,
+    optimize_front,
+)
 from nsr_engine.pipeline import (
     blocked_time_series_splits,
     evaluate_with_sympy,
@@ -186,10 +195,82 @@ def parse_args() -> argparse.Namespace:
     )
     engine.add_argument("--prefilter-per-complexity", type=int, default=16)
 
+    layers = parser.add_argument_group("accuracy layers")
+    _add_bool_arg(
+        layers,
+        "boosting",
+        default=False,
+        help_text=(
+            "Fit additive terms by running the engine on the residual of the "
+            "previous rounds (accuracy layer 1)."
+        ),
+        disable_help_text="Run a single engine fit (no residual boosting).",
+    )
+    layers.add_argument("--boosting-max-rounds", type=int, default=3)
+    layers.add_argument("--boosting-min-gain", type=float, default=0.02)
+    layers.add_argument(
+        "--term-selection",
+        choices=("elbow", "min_mse"),
+        default="elbow",
+        help="Which point of each boosting round's front becomes the term.",
+    )
+    _add_bool_arg(
+        layers,
+        "constant_opt",
+        default=False,
+        help_text="Refit float constants by least squares (accuracy layer 2).",
+        disable_help_text="Leave discovered constants as the search found them.",
+    )
+    layers.add_argument(
+        "--max-free-consts",
+        type=int,
+        default=12,
+        help="Skip constant optimization for expressions with more free constants.",
+    )
+    layers.add_argument(
+        "--max-nfev",
+        type=int,
+        default=200,
+        help="Maximum residual evaluations per constant-optimization solve.",
+    )
+    _add_bool_arg(
+        layers,
+        "joint_refit",
+        default=False,
+        help_text=(
+            "Re-weight the boosted terms jointly and prune redundant ones "
+            "(accuracy layer 3; requires --boosting)."
+        ),
+        disable_help_text="Keep the boosted terms as greedily fitted.",
+    )
+    layers.add_argument(
+        "--joint-refit-estimator",
+        choices=("lasso_cv", "ols"),
+        default="lasso_cv",
+    )
+    layers.add_argument("--coef-rel-tol", type=float, default=1e-3)
+    # Shared by layers 2 and 3: both cap the rows they fit on.
+    layers.add_argument(
+        "--fit-subsample",
+        type=int,
+        default=8000,
+        help=(
+            "Maximum rows the constant fit (layer 2) and the joint refit "
+            "(layer 3) see. 0 uses every row. Reported scores always use "
+            "every row."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.input_csv is not None and args.target_col is None:
         parser.error("--target-col is required when --input-csv is provided")
+
+    if args.joint_refit and not args.boosting:
+        parser.error("--joint-refit requires --boosting (it consumes the boosted terms)")
+
+    if args.boosting and args.boosting_max_rounds < 1:
+        parser.error("--boosting-max-rounds must be at least 1")
 
     if args.validation_mode in {"holdout", "sequential"}:
         try:
@@ -245,6 +326,87 @@ def _build_engine(args: argparse.Namespace, *, cache_prefix: str | None = None) 
     )
 
 
+def _fit_front(args: argparse.Namespace, X, y, *, cache_prefix: str | None = None):
+    """Fit the engine, applying whichever accuracy layers are enabled."""
+    const_opt_kwargs = {
+        "max_nfev": args.max_nfev,
+        "seed": args.seed,
+        "max_free_consts": args.max_free_consts,
+        "fit_subsample": args.fit_subsample,
+    }
+    refiner = (
+        functools.partial(optimize_constants, **const_opt_kwargs)
+        if args.constant_opt
+        else None
+    )
+
+    if not args.boosting:
+        front = _build_engine(args, cache_prefix=cache_prefix).fit(X, y)
+        if not args.constant_opt:
+            return front
+        return optimize_front(front, X, y, **const_opt_kwargs)
+
+    if args.score_metric != "mse":
+        print(
+            f"[nsr] note: boosted front points are scored in MSE, not "
+            f"{args.score_metric!r} (terms are still selected by "
+            f"{args.score_metric!r})."
+        )
+
+    def engine_factory(round_idx: int) -> NSREngine:
+        prefix = cache_prefix if cache_prefix is not None else args.cache_prefix
+        engine = _build_engine(args, cache_prefix=f"{prefix}_round{round_idx}")
+        # A fresh engine per round, with a seed that moves, so rounds do not
+        # repeat the same search on the residual.
+        engine.random_state += round_idx
+        return engine
+
+    booster = ResidualBoostedNSR(
+        engine_factory,
+        max_rounds=args.boosting_max_rounds,
+        min_gain=args.boosting_min_gain,
+        term_refiner=refiner,
+        term_selection=args.term_selection,
+    )
+    front = booster.fit(X, y)
+    for record in booster.rounds_:
+        print(
+            f"[nsr] boost round {record['round']}: added={record['added']} "
+            f"gain={record['gain']:.4f} cum_mse={record['cum_mse']:.6f} "
+            f"({record['reason']})"
+        )
+
+    if not args.joint_refit or not booster.terms_:
+        return front
+
+    refined = joint_refit_prune(
+        booster.terms_,
+        X,
+        y,
+        coef_rel_tol=args.coef_rel_tol,
+        seed=args.seed,
+        estimator=args.joint_refit_estimator,
+        fit_subsample=args.fit_subsample,
+        polish=refiner,
+    )
+    if refined is None:
+        print("[nsr] joint refit produced no usable model — keeping boosted front")
+        return front
+
+    expr, complexity, mse = refined
+    # The polished sum is flattened, so its sympy structure no longer reveals
+    # how many basis terms survived; complexity does, since both sides use the
+    # boosting convention.
+    summed = sum(c for _, c in booster.terms_) + (len(booster.terms_) - 1)
+    if complexity < summed:
+        print(f"[nsr] joint refit pruned terms (complexity {summed} -> {complexity})")
+    points = list(front.points)
+    points.append(
+        ParetoPoint(equation=str(expr), sympy_expr=expr, complexity=complexity, mse=mse)
+    )
+    return ParetoFront(points).dominance_filter()
+
+
 def _print_selected_front(front, *, title: str) -> object:
     if len(front) == 0:
         raise RuntimeError(
@@ -285,8 +447,12 @@ def _run_validation_folds(args: argparse.Namespace, X, y) -> None:
     fold_rmses: list[float] = []
     print(f"\n{args.validation_mode} validation")
     for fold in folds:
-        engine = _build_engine(args, cache_prefix=f"{args.cache_prefix}_{fold.name}")
-        front = engine.fit(fold.X_train, fold.y_train)
+        front = _fit_front(
+            args,
+            fold.X_train,
+            fold.y_train,
+            cache_prefix=f"{args.cache_prefix}_{fold.name}",
+        )
         if len(front) == 0:
             print(f"{fold.name}_rmse=nan")
             continue
@@ -326,7 +492,7 @@ def main() -> None:
                 shuffle=split_shuffle,
             )
         )
-        front = _build_engine(args).fit(X_train, y_train)
+        front = _fit_front(args, X_train, y_train)
         selected = _print_selected_front(front, title="Pareto front")
 
         if X_validation is not None and y_validation is not None:
@@ -343,7 +509,7 @@ def main() -> None:
 
     _run_validation_folds(args, X, y)
 
-    front = _build_engine(args).fit(X, y)
+    front = _fit_front(args, X, y)
     _print_selected_front(front, title="Pareto front")
 
 

@@ -10,6 +10,7 @@ python examples/csv_input.py
 python examples/custom_metric_library.py
 python examples/cached_run.py
 python examples/memmap_out_of_core.py
+python examples/accuracy_layers.py
 ```
 
 All scripts accept the same basic sizing arguments:
@@ -44,6 +45,7 @@ full CLI when you want to switch validation strategies from the command line.
 | `examples/custom_metric_library.py` | Custom engine configuration | Uses `score_metric="mae"` with a reduced binary, unary, and constant token library. |
 | `examples/cached_run.py` | Cache reuse | Runs two fits against the same temporary cache directory so the second run loads cached lambda candidates. |
 | `examples/memmap_out_of_core.py` | Out-of-core training | Writes generated data to Parquet, builds a `MemmapDataset`, and trains through `fit_memmap`. This case requires `pyarrow`. |
+| `examples/accuracy_layers.py` | Accuracy layers | Stacks all three layers on a two-additive-term target (`exp(x2) - 1.5*log(x4)`) and prints the elbow test R2 after each stage, so each layer's contribution is visible. This case requires the `refine` extra. |
 
 ## Dependency Notes
 
@@ -58,4 +60,10 @@ The memmap example additionally requires PyArrow:
 
 ```bash
 pip install "nsr-engine[memmap]"
+```
+
+The accuracy layers example additionally requires SciPy and scikit-learn:
+
+```bash
+pip install "nsr-engine[refine]"
 ```

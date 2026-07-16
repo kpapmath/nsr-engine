@@ -341,6 +341,50 @@ flowchart TD
 The `elbow()` helper sorts points by complexity and returns the formula with
 the largest score drop per added unit of complexity.
 
+## Accuracy Layers
+
+Everything above produces a front from a single `fit`. Three optional post-hoc
+layers extend that front. They consume only the SymPy expressions the engine
+emits, so they change neither the policy nor the reward, and each is
+accept-if-better. Full detail is in [accuracy_layers.md](accuracy_layers.md);
+this section covers where they sit in the method.
+
+The affine reward described above has two structural limits, and the layers
+address them:
+
+| Limit | Consequence | Layer |
+| --- | --- | --- |
+| The reward fits `b0 + b1 * expr` — one expression, not a sum `b0 + Σ bₖ·exprₖ`. | When the target is a sum of additive terms of comparable magnitude, the one-shot fit locks onto whichever expression correlates best and collapses the rest into a linear surrogate. | 1 — residual boosting, then 3 — joint refit |
+| Constants come only from the fixed token set plus the affine `b0, b1`. | Interior weights are unreachable, so the search substitutes operator surrogates and slightly wrong coefficients. | 2 — constant optimization |
+
+```mermaid
+flowchart TD
+    A[ParetoFront from one fit] --> B{Boosting enabled?}
+    B -->|no| F[Optional constant optimization on every point]
+    B -->|yes| C[Round k: fit a fresh engine on the residual]
+    C --> D[Pick the round's elbow term]
+    D --> E[Optional constant optimization of that term]
+    E --> G{Relative MSE gain >= min_gain?}
+    G -->|yes| H[Subtract the term, record it in terms_]
+    H --> C
+    G -->|no| I[Stop: cumulative front plus terms_]
+    I --> J{Joint refit enabled?}
+    J -->|yes| K[LASSO re-weight terms_, prune, polish]
+    J -->|no| L[ParetoFront]
+    K --> L
+    F --> L
+```
+
+Layer 1 works because round *k* fits the residual left by rounds `1…k-1`, so it
+only has to explain one more term. The affine reward solves each single-term
+subproblem, and the rounds sum to the multi-term formula a one-shot fit cannot
+express. The complexity of a boosted point is the sum of its terms' complexities
+plus one `+` node per join, which keeps boosted models on the same complexity
+axis as every other method.
+
+Layer 1 is greedy — a term chosen early is never revised. Layer 3 corrects that
+by re-weighting the discovered terms jointly rather than one at a time.
+
 ## In-Memory Versus Memmap Training
 
 ```mermaid
@@ -404,3 +448,7 @@ or, when `cache_prefix` is set:
 | Lower memory during training | Set `step_subsample_size` or use `fit_memmap`. |
 | Better final candidate diversity | Increase `prefilter_per_complexity`. |
 | Reproducible experiments | Set `random_state`, cache with `cache_dir`, and keep data ordering fixed. |
+| Target is a sum of additive terms | Enable residual boosting; raise `max_rounds` and lower `min_gain` to keep more terms. |
+| Formula needs non-quantized interior constants | Enable constant optimization. |
+| Boosted terms look redundant or over-weighted | Enable joint refit, and lower `coef_rel_tol` to prune less aggressively. |
+| Accuracy layers are slow on a very large table | Lower `fit_subsample`; it caps the rows both the constant fit and the joint refit see, and reported scores still use every row. |

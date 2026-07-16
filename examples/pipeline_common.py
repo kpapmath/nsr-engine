@@ -22,19 +22,24 @@ def small_engine(
     cache_dir: Path | None = None,
     **overrides: object,
 ) -> NSREngine:
-    """Build a fast example engine with conservative CPU-sized defaults."""
+    """Build a fast example engine with conservative CPU-sized defaults.
+
+    Any default here can be replaced through ``overrides``.
+    """
+    defaults: dict[str, object] = {
+        "batch_size": 24,
+        "max_len": 7,
+        "hidden_dim": 32,
+        "embed_dim": 12,
+        "prefilter_per_complexity": 4,
+    }
     return NSREngine(
         n_lambda=n_lambda,
         n_iters=n_iters,
-        batch_size=24,
-        max_len=7,
-        hidden_dim=32,
-        embed_dim=12,
         random_state=seed,
         cache_dir=cache_dir,
         cache_prefix="pipeline_examples",
-        prefilter_per_complexity=4,
-        **overrides,
+        **{**defaults, **overrides},
     )
 
 

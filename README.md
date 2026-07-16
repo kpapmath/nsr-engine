@@ -10,6 +10,7 @@ Single-objective training is turned into a **Pareto front** by sweeping a comple
 pip install nsr-engine                  # core (numpy, pandas, torch)
 pip install "nsr-engine[sympy]"         # + sympy for human-readable formulas
 pip install "nsr-engine[memmap,sympy]"  # + pyarrow for out-of-core fit_memmap
+pip install "nsr-engine[refine]"        # + scipy/scikit-learn for the accuracy layers
 ```
 
 From source:
@@ -17,7 +18,7 @@ From source:
 ```bash
 git clone https://github.com/kpapmath/nsr-engine
 cd nsr-engine
-pip install -e ".[sympy,memmap,dev]"
+pip install -e ".[sympy,memmap,refine,dev]"
 ```
 
 ## Quick start
@@ -47,6 +48,45 @@ front = engine.fit(X, y)
 print(front.to_frame())
 print("elbow formula:", front.elbow().equation)
 ```
+
+## Accuracy layers
+
+Three optional post-hoc passes sit on top of the engine's output. They operate on
+the sympy expressions the engine emits — no change to the policy or the reward —
+and each is **accept-if-better**, so enabling one can never make the training fit
+worse.
+
+| Layer | What it fixes | API |
+|---|---|---|
+| 1 — Residual boosting | The affine reward fits **one** expression, not a sum. Two additive terms of comparable magnitude collapse into a linear surrogate. Each round runs a fresh engine on the previous residual, so the rounds sum to `intercept + Σₖ bₖ·exprₖ`. | `ResidualBoostedNSR` |
+| 2 — Constant optimization | Constants are quantized to the token set plus the affine `b0, b1`, so interior weights (the `1.5` in `1.5*log(x4)`) are unreachable. Refits every float by least squares. | `optimize_constants`, `optimize_front` |
+| 3 — Joint refit + prune | Boosting scales each term once and never revisits it. Re-weights the discovered terms jointly with LASSO and drops the redundant ones. | `joint_refit_prune` |
+
+```python
+from nsr_engine import NSREngine, ResidualBoostedNSR, joint_refit_prune, optimize_constants
+
+def engine_factory(round_idx: int) -> NSREngine:
+    return NSREngine(n_lambda=4, n_iters=150, max_len=17, random_state=42 + round_idx,
+                     unary_ops=("square", "abs", "log", "exp", "sqrt"))
+
+booster = ResidualBoostedNSR(engine_factory, max_rounds=3, min_gain=0.02,
+                             term_refiner=optimize_constants)   # layers 1 + 2
+front = booster.fit(X, y)
+
+refined = joint_refit_prune(booster.terms_, X, y)               # layer 3
+```
+
+On a two-additive-term target (`exp(x2) - 1.5*log(x4)`, medium noise) this moves
+elbow test R² from **0.66** (plain NSR) to **0.835** (boosting) to **0.879**
+(joint refit). From the CLI:
+
+```bash
+python main.py --boosting --constant-opt --joint-refit
+```
+
+Full detail, measured results across the benchmark grid, and known limitations
+are in the [accuracy layers guide](docs/accuracy_layers.md). A runnable
+progression is in `examples/accuracy_layers.py`.
 
 ## Full pipeline example
 

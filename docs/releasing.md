@@ -43,7 +43,7 @@ Edit `src/nsr_engine/__init__.py` and set `__version__` to the new value.
 ### 3. Run the tests and the build locally
 
 ```bash
-pip install -e ".[sympy,memmap,dev]"
+pip install -e ".[sympy,memmap,refine,dev]"
 python -m pytest tests/ -v
 
 # confirm the package builds and its metadata is valid
@@ -104,7 +104,7 @@ should be kept roughly in sync with `pyproject.toml` when you change deps.
 After changing any dependency bounds:
 
 ```bash
-pip install -e ".[sympy,memmap,dev]"
+pip install -e ".[sympy,memmap,refine,dev]"
 python -m pytest tests/ -v
 ```
 

@@ -25,12 +25,18 @@ Install with out-of-core Parquet to memmap support:
 pip install "nsr-engine[memmap,sympy]"
 ```
 
+Install with the accuracy layers (adds `scipy` and `scikit-learn`):
+
+```bash
+pip install "nsr-engine[refine]"
+```
+
 Install from source for development:
 
 ```bash
 git clone https://github.com/kpapmath/nsr-engine
 cd nsr-engine
-pip install -e ".[sympy,memmap,dev]"
+pip install -e ".[sympy,memmap,refine,dev]"
 ```
 
 ## Minimal In-Memory Run
@@ -134,7 +140,7 @@ python main.py --help
 
 ## Full Pipeline CLI Arguments
 
-The CLI exposes data, split, and engine options.
+The CLI exposes data, split, engine, and accuracy-layer options.
 
 | Argument | Default | Explanation |
 | --- | --- | --- |
@@ -173,6 +179,21 @@ The CLI exposes data, split, and engine options.
 | `--affine-reward` / `--no-affine-reward` | `True` | Enable or disable least-squares affine scoring. |
 | `--metric`, `--score-metric` | `"mse"` | Score metric passed to `NSREngine`. |
 | `--prefilter-per-complexity` | `16` | Approximate-score candidates kept per complexity before exact evaluation. |
+| `--boosting` / `--no-boosting` | `False` | Accuracy layer 1. Fit additive terms by re-running the engine on each round's residual. |
+| `--boosting-max-rounds` | `3` | Hard cap on the number of additive terms. |
+| `--boosting-min-gain` | `0.02` | Minimum relative training-MSE improvement for a round to be kept. |
+| `--term-selection` | `"elbow"` | `elbow` or `min_mse`. Which point of each round's front becomes that round's term. |
+| `--constant-opt` / `--no-constant-opt` | `False` | Accuracy layer 2. Refit float constants by least squares. |
+| `--max-free-consts` | `12` | Skip constant optimization for expressions with more free constants than this. |
+| `--max-nfev` | `200` | Maximum residual evaluations per least-squares solve. |
+| `--joint-refit` / `--no-joint-refit` | `False` | Accuracy layer 3. Jointly re-weight and prune the boosted terms. Requires `--boosting`. |
+| `--joint-refit-estimator` | `"lasso_cv"` | `lasso_cv` or `ols`. Estimator for the joint refit. |
+| `--coef-rel-tol` | `1e-3` | Relative weight threshold below which a term is pruned. |
+| `--fit-subsample` | `8000` | Shared by layers 2 and 3: maximum rows the constant fit and the joint refit see. `0` uses every row. |
+
+The accuracy layers are off by default and need the `refine` extra. See the
+[accuracy layers guide](accuracy_layers.md) and the
+[CLI reference](cli_reference.md#accuracy-layer-arguments).
 
 Validation modes:
 
@@ -362,4 +383,100 @@ Each point is a `ParetoPoint` with:
 | `complexity` | Token count of the sampled prefix expression before affine wrapping. |
 | `mse` | Backward-compatible score value field. It contains exact MSE when `score_metric="mse"` and the selected metric value otherwise. |
 | `score` | Internal value used for Pareto dominance. It matches `mse` for lower-is-better metrics and is negated for `"r2"` and `"adjusted_r2"`. |
+
+## Accuracy Layers
+
+Three optional post-hoc passes over a front. They require the `refine` extra and
+are documented in full, with measured results, in
+[accuracy_layers.md](accuracy_layers.md).
+
+```python
+from nsr_engine import (
+    NSREngine, ParetoFront, ParetoPoint, ResidualBoostedNSR,
+    joint_refit_prune, optimize_constants,
+)
+
+def engine_factory(round_idx: int) -> NSREngine:
+    return NSREngine(n_lambda=4, n_iters=150, max_len=17,
+                     unary_ops=("square", "abs", "log", "exp", "sqrt"),
+                     random_state=42 + round_idx)
+
+booster = ResidualBoostedNSR(engine_factory, max_rounds=3, min_gain=0.02,
+                             term_refiner=optimize_constants)
+front = booster.fit(X, y)
+
+refined = joint_refit_prune(booster.terms_, X, y)
+if refined is not None:
+    expr, complexity, mse = refined
+    points = list(front.points)
+    points.append(ParetoPoint(equation=str(expr), sympy_expr=expr,
+                              complexity=complexity, mse=mse))
+    front = ParetoFront(points).dominance_filter()
+```
+
+### `ResidualBoostedNSR` Arguments
+
+Conforms to the same `fit(X, y) -> ParetoFront` contract as `NSREngine`.
+
+| Argument | Default | Explanation |
+| --- | --- | --- |
+| `engine_factory` | required | `factory(round_idx) -> engine` with `engine.fit(X, y) -> ParetoFront`, called once per round with the 1-based round index. Must return a fresh engine; vary its seed with `round_idx`. |
+| `max_rounds` | `3` | Hard cap on the number of additive terms. |
+| `min_gain` | `0.02` | After round 1, a round is kept only if it cuts training MSE by at least this relative amount. |
+| `term_refiner` | `None` | Optional `f(expr, X, residual) -> expr` hook applied to each picked term before it is subtracted. Pass `optimize_constants` to run layer 2 inside layer 1. |
+| `term_selection` | `"elbow"` | `"elbow"` or `"min_mse"`. Which point of each round's front becomes that round's term. |
+
+After `fit`:
+
+| Attribute | Explanation |
+| --- | --- |
+| `rounds_` | Per-round diagnostics: `round`, `added`, `reason`, `gain`, `term`, `cum_mse`. |
+| `terms_` | List of `(sympy_expr, complexity)` for each kept term. This is the input to `joint_refit_prune`. |
+
+Front points are scored in MSE, and are non-dominated by construction.
+
+### `optimize_constants` Arguments
+
+```python
+expr = optimize_constants(expr, X, y, max_nfev=200, seed=0)
+```
+
+| Argument | Default | Explanation |
+| --- | --- | --- |
+| `expr` | required | SymPy expression in raw feature terms. |
+| `X` | required | Feature table whose columns are the expression's free symbols. |
+| `y` | required | Target values aligned row-for-row with `X`. |
+| `max_nfev` | `200` | Maximum residual evaluations for `scipy.optimize.least_squares`. |
+| `seed` | `0` | Seed for the sub-sample RNG. Makes the call deterministic. |
+| `max_free_consts` | `12` | Return `expr` unchanged when it has more free constants than this. Keyword-only. |
+| `fit_subsample` | `8000` | Maximum rows the fit sees. `0` uses every row. Keyword-only. |
+
+Returns a new expression with optimised constants, or `expr` unchanged if there
+is nothing to optimise, the fit fails, or the result does not lower the
+sub-sampled training MSE. Complexity is always preserved. Expressions with no
+`Float` nodes, or with more than 12 of them, are returned unchanged.
+
+`optimize_front(front, X, y, seed=0)` applies the same pass to every point of a
+front, preserving each point's `score_metric`.
+
+### `joint_refit_prune` Arguments
+
+```python
+refined = joint_refit_prune(terms, X, y, coef_rel_tol=1e-3, seed=0)
+```
+
+| Argument | Default | Explanation |
+| --- | --- | --- |
+| `terms` | required | `list[(sympy_expr, complexity)]`, normally `booster.terms_`. |
+| `X`, `y` | required | Data to refit against. |
+| `coef_rel_tol` | `1e-3` | Prune a term when `abs(w) <= coef_rel_tol * max(abs(w))`. |
+| `seed` | `0` | Seed for the sub-sample RNG and `LassoCV`. |
+| `estimator` | `"lasso_cv"` | `"lasso_cv"` for sparse weights, or `"ols"` to skip the sparsity penalty. Keyword-only. |
+| `fit_subsample` | `8000` | Maximum rows the estimator and the polish see. `0` uses every row. Keyword-only. |
+| `polish` | `optimize_constants` | Final polish applied to the reassembled sum, called as `polish(expr, X, y, seed=..., fit_subsample=...)`. Pass `None` to skip it. Keyword-only. |
+
+Returns `(expr, complexity, train_mse)`, or `None` if no term survives — for
+example when every term evaluates non-finite. `train_mse` is always computed on
+every row, whatever `fit_subsample` is set to, so the point stays comparable to
+the boosted front's points.
 | `score_metric` | Metric used to compute the score: `"mse"`, `"rmse"`, `"mae"`, `"mape"`, `"mbd"`, `"r2"`, or `"adjusted_r2"`. |

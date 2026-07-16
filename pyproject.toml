@@ -28,9 +28,23 @@ nsr-engine = "nsr_engine.main:main"
 [project.optional-dependencies]
 sympy = ["sympy>=1.12"]
 memmap = ["pyarrow>=14.0"]
+# Accuracy layers: boosting needs sympy, constant optimization adds scipy,
+# joint refit + prune adds scikit-learn.
+refine = [
+  "sympy>=1.12",
+  "scipy>=1.11",
+  "scikit-learn>=1.3",
+]
 dev = [
   "pytest>=8.0",
   "sympy>=1.12",
+  "scipy>=1.11",
+  "scikit-learn>=1.3",
+]
+
+[tool.pytest.ini_options]
+markers = [
+  "slow: exercises a real NSREngine fit rather than a stub engine",
 ]
 
 [tool.setuptools]
