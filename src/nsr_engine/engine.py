@@ -37,8 +37,14 @@ Performance design
 * During training only cheap numpy rewards are computed on the (standardized,
   float32) step data.  Candidates are tracked as token tuples with their best
   subsample score; the exact full-set score and the sympy conversion happen
-  once after the lambda-sweep, for a small pre-filtered set (top-K per
-  complexity).
+  once after the lambda-sweep.
+* The subsample score drives the policy only — it never decides front
+  membership.  Candidates are scored exactly on the full dataset *before* the
+  top-K-per-complexity truncation, which makes that truncation
+  *front-preserving*: a front member is exact-optimal at its complexity, so it
+  ranks first in its group and cannot be evicted (see ``prefilter_metric``).
+  This is distinct from *numeric determinism* (float32 eval / float64 scoring /
+  fixed seeds); the two properties are separate and separately testable.
 * Expression evaluation runs in float32 (halving temporary-array RAM); the
   affine least-squares scoring casts the masked prediction vector to float64
   so accumulated statistics stay accurate.
@@ -46,6 +52,7 @@ Performance design
 
 from __future__ import annotations
 
+import heapq
 import json
 import math
 from dataclasses import dataclass
@@ -164,6 +171,29 @@ def _sympy_unary_map(sp: Any) -> dict[str, Any]:
 _SUPPORTED_UNARY_OPS: tuple[str, ...] = tuple(_NUMPY_UNARY)
 _CONST_VALUES: dict[str, float] = {t: float(t) for t in _CONST_TOKENS}
 
+# Semantic sampling constraints (Track A / A3).  Keys are unary parent tokens;
+# values are the child tokens forbidden *immediately beneath* them in prefix
+# notation.  Only compositions that collapse to a simpler expression are listed
+# (e.g. exp(log x) == x, sqrt(x^2) == |x|, abs(abs x) == abs x), so masking them
+# never removes a *needed* structure -- it only stops the sampler from spending
+# its budget on provably redundant subtrees.  In prefix order a unary op is
+# always followed by the root of its operand, so "forbidden child" maps exactly
+# to "forbidden next token after this parent".
+_UNARY_CHILD_FORBIDDEN: dict[str, tuple[str, ...]] = {
+    "exp": ("log", "log10", "log2"),        # exp(log x) == x
+    "log": ("exp", "abs"),                   # log(exp x) == x; log already |·|
+    "log10": ("exp",),
+    "log2": ("exp",),
+    "sqrt": ("square", "abs"),               # sqrt(x^2) == |x|; sqrt already |·|
+    "square": ("sqrt", "abs"),               # square(sqrt x) == |x|; sq(|x|)==x^2
+    "cube": ("cbrt",),
+    "cbrt": ("cube",),
+    "abs": ("abs", "square", "sqrt"),        # idempotent / already-nonneg child
+    "reciprocal": ("reciprocal",),           # 1/(1/x) == x
+    "neg": ("neg",),                          # -(-x) == x
+    "sign": ("sign", "abs"),
+}
+
 _START_TOKEN = "<s>"  # sentinel fed at step 0
 _SCORE_METRICS: tuple[str, ...] = (
     "mse",
@@ -175,6 +205,7 @@ _SCORE_METRICS: tuple[str, ...] = (
     "adjusted_r2",
 )
 _METRIC_EPS = 1e-10
+_PREFILTER_METRICS: tuple[str, ...] = ("exact", "approx")
 
 
 def _get_arity(
@@ -558,6 +589,8 @@ class _TokenLibrary:
     terminal_mask: "torch.Tensor"
     unary_mask: "torch.Tensor"
     binary_mask: "torch.Tensor"
+    feature_mask: "torch.Tensor"  # (V_out,) True for feature (variable) tokens
+    child_forbidden: "torch.Tensor"  # (V, V_out) True => token forbidden as child
 
 
 def _make_library(
@@ -571,6 +604,26 @@ def _make_library(
     v_out = len(vocab) - 1
     arities = [_get_arity(vocab[i], binary_ops, unary_ops) for i in range(v_out)]
     arity = torch.tensor(arities, dtype=torch.long, device=device)
+
+    feature_set = set(features)
+    feature_mask = torch.tensor(
+        [vocab[i] in feature_set for i in range(v_out)],
+        dtype=torch.bool,
+        device=device,
+    )
+    # Row per possible *previous* token (full vocab incl. start), column per
+    # emittable child token.  Rows for non-unary parents (and the start token)
+    # stay all-False, so the constraint only ever fires under a unary parent.
+    child_forbidden = torch.zeros(len(vocab), v_out, dtype=torch.bool, device=device)
+    for parent, children in _UNARY_CHILD_FORBIDDEN.items():
+        p = token_to_id.get(parent)
+        if p is None:
+            continue
+        for child in children:
+            c = token_to_id.get(child)
+            if c is not None and c < v_out:
+                child_forbidden[p, c] = True
+
     return _TokenLibrary(
         vocab=vocab,
         token_to_id=token_to_id,
@@ -579,6 +632,8 @@ def _make_library(
         terminal_mask=(arity == 0),
         unary_mask=(arity == 1),
         binary_mask=(arity == 2),
+        feature_mask=feature_mask,
+        child_forbidden=child_forbidden,
     )
 
 
@@ -586,18 +641,48 @@ def _make_library(
 # Batched sequence sampling with arity-aware masking
 # ---------------------------------------------------------------------------
 
+def _allowed_mask(
+    lib: _TokenLibrary,
+    arity_remaining: torch.Tensor,
+    prev_token_ids: torch.Tensor,
+    budget: int,
+    constrain: bool,
+) -> torch.Tensor:
+    """Boolean ``(B, V_out)`` mask of tokens emittable at the current step.
+
+    Combines the arity/length well-formedness rules (a token may be chosen only
+    if the remaining budget can still complete the tree) with the optional
+    semantic grammar constraints (A3): tokens forbidden as the direct child of
+    the previous unary parent are removed, unless doing so would leave a row
+    with no legal token, in which case the constraint is skipped for that row.
+    """
+    need = arity_remaining.unsqueeze(1)
+    allow = lib.terminal_mask.unsqueeze(0) | (
+        lib.binary_mask.unsqueeze(0) & (budget >= need + 2)
+    ) | (
+        lib.unary_mask.unsqueeze(0) & (budget >= need + 1)
+    )
+    if constrain:
+        constrained = allow & ~lib.child_forbidden[prev_token_ids]
+        dead = ~constrained.any(dim=1, keepdim=True)
+        allow = torch.where(dead, allow, constrained)
+    return allow
+
+
 def _sample_batch(
     policy: _GRUPolicy,
     lib: _TokenLibrary,
     batch_size: int,
     max_len: int,
     device: torch.device,
+    constrain: bool = False,
 ) -> tuple[list[list[str]], torch.Tensor, torch.Tensor]:
     """Sample ``batch_size`` expressions from the policy in parallel.
 
     Returns ``(sequences, seq_log_probs, entropies)`` where ``seq_log_probs``
     and ``entropies`` are ``(batch_size,)`` tensors retaining the gradient
     graph for REINFORCE.  Every sequence is a complete prefix expression.
+    ``constrain`` enables the A3 semantic grammar constraints.
     """
     b = batch_size
     hidden = policy.init_hidden(device, b)
@@ -614,13 +699,7 @@ def _sample_batch(
         logits, hidden_new = policy.step_batch(token_ids, hidden)
         hidden = torch.where(active.unsqueeze(1), hidden_new, hidden)
 
-        budget = max_len - step
-        need = arity_remaining.unsqueeze(1)
-        allow = lib.terminal_mask.unsqueeze(0) | (
-            lib.binary_mask.unsqueeze(0) & (budget >= need + 2)
-        ) | (
-            lib.unary_mask.unsqueeze(0) & (budget >= need + 1)
-        )
+        allow = _allowed_mask(lib, arity_remaining, token_ids, max_len - step, constrain)
 
         logits = logits.masked_fill(~allow, -1e9)
         log_p = F.log_softmax(logits, dim=-1)
@@ -656,6 +735,57 @@ def _sample_batch(
         for i in range(b)
     ]
     return sequences, seq_log_prob, entropy_sum
+
+
+def _sequence_log_probs(
+    policy: _GRUPolicy,
+    lib: _TokenLibrary,
+    sequences: list[list[str]],
+    max_len: int,
+    device: torch.device,
+    constrain: bool,
+) -> torch.Tensor:
+    """Teacher-forced log-prob of each given token sequence under ``policy``.
+
+    Replays the sequences through the GRU with the *same* arity/constraint
+    masking used at sampling time, so the returned ``(B,)`` log-probs are
+    consistent with :func:`_sample_batch`.  Used by priority-queue training
+    (A2) to raise the likelihood of the best sequences discovered so far.
+    """
+    b = len(sequences)
+    lengths = [min(len(s), max_len) for s in sequences]
+    span = max(lengths) if lengths else 0
+    if span == 0:
+        return torch.zeros(b, device=device)
+
+    ids = torch.zeros(b, span, dtype=torch.long, device=device)
+    active_mat = torch.zeros(b, span, dtype=torch.bool, device=device)
+    for i, seq in enumerate(sequences):
+        for t, tok in enumerate(seq[:span]):
+            ids[i, t] = lib.token_to_id[tok]
+            active_mat[i, t] = True
+
+    hidden = policy.init_hidden(device, b)
+    token_ids = torch.full((b,), lib.start_id, dtype=torch.long, device=device)
+    arity_remaining = torch.ones(b, dtype=torch.long, device=device)
+    logp = torch.zeros(b, device=device)
+
+    for step in range(span):
+        logits, hidden = policy.step_batch(token_ids, hidden)
+        allow = _allowed_mask(lib, arity_remaining, token_ids, max_len - step, constrain)
+        logits = logits.masked_fill(~allow, -1e9)
+        log_p = F.log_softmax(logits, dim=-1)
+
+        cur = ids[:, step]
+        active = active_mat[:, step]
+        step_lp = log_p.gather(1, cur.unsqueeze(1)).squeeze(1)
+        step_lp = torch.nan_to_num(step_lp, nan=0.0, posinf=0.0, neginf=-50.0)
+        logp = logp + step_lp * active.float()
+
+        arity_remaining = arity_remaining + (lib.arity[cur] - 1) * active.long()
+        token_ids = torch.where(active, cur, token_ids)
+
+    return logp
 
 
 # ---------------------------------------------------------------------------
@@ -716,8 +846,56 @@ class NSREngine:
         ``"mae"``, ``"mape"``, ``"mbd"``, ``"r2"``, and
         ``"adjusted_r2"``.
     prefilter_per_complexity:
-        How many lowest-approx-score candidates per complexity level survive to
-        the exact scoring + sympy-conversion stage.
+        How many best-scoring candidates per complexity level survive to the
+        sympy-conversion stage.
+    prefilter_metric:
+        Which score ranks the prefilter.  ``"exact"`` (default) scores candidates
+        on the full dataset *before* truncating, so truncation is
+        **front-preserving**: a front member is exact-optimal at its complexity,
+        hence ranks first in its group and cannot be evicted.  ``"approx"`` is the
+        pre-0.4 behaviour — it ranks by the noisy subsampled training score, which
+        can drop the exact-best candidate at a complexity and silently perturb the
+        front.  Keep ``"approx"`` only to reproduce or profile old runs.
+    exact_prefilter_multiple:
+        Cost guard for ``prefilter_metric="exact"``.  Exact scoring is a full pass
+        over the data per candidate, and the raw pool typically runs ~10-15x larger
+        than the kept set, so scoring all of it can dominate a large-dataset fit.
+        With an int *m*, the pool is first cut to ``m * prefilter_per_complexity``
+        per complexity by approx score, and only that set is scored exactly; the
+        guarantee then holds *conditional on* the true front member surviving a cut
+        that is ``m`` times looser than the final one.  ``None`` scores the entire
+        pool and makes the guarantee unconditional, at proportionally higher cost.
+    grammar_constraints:
+        Enable the A3 semantic sampling constraints that forbid provably
+        redundant unary compositions (``exp(log x)``, ``sqrt(x^2)``,
+        ``abs(abs x)``, ...), saving the sample budget for useful structure.
+    reinforce_all_valid:
+        Enable the A1 dense learning signal: in addition to the risk-seeking
+        elite term, reinforce every above-baseline sample against an EWMA
+        reward baseline.  Without it the gradient comes from only the top
+        ``elite_frac`` of the batch (~1-2 samples at small batch sizes).
+    ewma_alpha:
+        Smoothing factor of the EWMA reward baseline used by
+        ``reinforce_all_valid`` (higher = faster-moving baseline).
+    pqt_k:
+        A2 priority-queue training: keep the best ``pqt_k`` unique sequences
+        found so far and add a supervised MLE loss that raises their
+        likelihood each step.  ``0`` disables PQT.
+    pqt_weight:
+        Target weight of the PQT MLE loss term relative to the policy-gradient
+        loss (reached after the warmup, see ``pqt_warmup_frac``).
+    entropy_weight_start:
+        Phase-2a exploration curriculum.  Initial entropy-bonus coefficient,
+        linearly annealed to ``entropy_weight`` over each lambda's iterations, so
+        the policy explores broadly early and commits late.  ``None`` disables
+        annealing (constant ``entropy_weight``).
+    pqt_warmup_frac:
+        Phase-2a exploitation curriculum.  Fraction of a lambda's iterations over
+        which the effective PQT weight ramps linearly from 0 up to ``pqt_weight``.
+        The priority queue still *accumulates* the best sequences from iteration
+        0; only its pull on the policy is delayed, which stops PQT from locking
+        onto an early, suboptimal basin before exploration has covered ground.
+        ``0.0`` applies full PQT weight immediately.
     """
 
     def __init__(
@@ -747,15 +925,45 @@ class NSREngine:
         affine_reward: bool = True,
         score_metric: str = "mse",
         prefilter_per_complexity: int = 16,
+        prefilter_metric: str = "exact",
+        exact_prefilter_multiple: int | None = 8,
+        grammar_constraints: bool = True,
+        reinforce_all_valid: bool = True,
+        ewma_alpha: float = 0.1,
+        pqt_k: int = 10,
+        pqt_weight: float = 1.0,
+        entropy_weight_start: float | None = 0.02,
+        pqt_warmup_frac: float = 0.3,
     ) -> None:
         if not _TORCH_AVAILABLE:
             raise ImportError(
                 "torch is required for NSREngine.  Install with: pip install torch"
             )
+        if not 0.0 < ewma_alpha <= 1.0:
+            raise ValueError(f"ewma_alpha must be in (0, 1] (got {ewma_alpha})")
+        if pqt_k < 0:
+            raise ValueError(f"pqt_k must be >= 0 (got {pqt_k})")
+        if pqt_weight < 0.0:
+            raise ValueError(f"pqt_weight must be >= 0 (got {pqt_weight})")
+        if entropy_weight_start is not None and entropy_weight_start < 0.0:
+            raise ValueError(
+                f"entropy_weight_start must be >= 0 or None (got {entropy_weight_start})"
+            )
+        if not 0.0 <= pqt_warmup_frac <= 1.0:
+            raise ValueError(f"pqt_warmup_frac must be in [0, 1] (got {pqt_warmup_frac})")
         score_metric = score_metric.lower()
         if score_metric not in _SCORE_METRICS:
             supported = ", ".join(repr(m) for m in _SCORE_METRICS)
             raise ValueError(f"score_metric must be one of: {supported}")
+        prefilter_metric = prefilter_metric.lower()
+        if prefilter_metric not in _PREFILTER_METRICS:
+            supported = ", ".join(repr(m) for m in _PREFILTER_METRICS)
+            raise ValueError(f"prefilter_metric must be one of: {supported}")
+        if exact_prefilter_multiple is not None and exact_prefilter_multiple < 1:
+            raise ValueError(
+                "exact_prefilter_multiple must be >= 1 or None "
+                f"(got {exact_prefilter_multiple})"
+            )
         self.lambda_grid = (
             tuple(lambda_grid)
             if lambda_grid is not None
@@ -789,6 +997,15 @@ class NSREngine:
         self.affine_reward = affine_reward
         self.score_metric = score_metric
         self.prefilter_per_complexity = prefilter_per_complexity
+        self.prefilter_metric = prefilter_metric
+        self.exact_prefilter_multiple = exact_prefilter_multiple
+        self.grammar_constraints = grammar_constraints
+        self.reinforce_all_valid = reinforce_all_valid
+        self.ewma_alpha = ewma_alpha
+        self.pqt_k = pqt_k
+        self.pqt_weight = pqt_weight
+        self.entropy_weight_start = entropy_weight_start
+        self.pqt_warmup_frac = pqt_warmup_frac
         self._feat_mean: dict[str, float] | None = None
         self._feat_std: dict[str, float] | None = None
 
@@ -956,15 +1173,19 @@ class NSREngine:
             print("[nsr] warning: no valid expressions discovered — returning empty front")
             return ParetoFront([])
 
-        candidates = self._prefilter_candidates(
+        candidates = self._select_for_exact_scoring(
             list(pool.values()), per_complexity=self.prefilter_per_complexity
         )
         print(
             f"[nsr] exact full-set {self.score_metric.upper()} for {len(candidates)} candidates "
-            f"({n_rows:,} rows) …",
+            f"({n_rows:,} rows, prefilter_metric={self.prefilter_metric}) …",
             flush=True,
         )
         exact = self._exact_eval_arrays(candidates, arrays, y_arr)
+        if self.prefilter_metric == "exact":
+            exact = self._truncate_exact_per_complexity(
+                exact, self.prefilter_per_complexity
+            )
         return self._assemble_front(exact)
 
     # ------------------------------------------------------------------
@@ -1030,17 +1251,20 @@ class NSREngine:
             print("[nsr] warning: no valid expressions discovered — empty front")
             return ParetoFront([])
 
-        candidates = self._prefilter_candidates(
+        candidates = self._select_for_exact_scoring(
             list(pool.values()), per_complexity=per_complexity
         )
         print(
             f"[nsr] exact full-set {self.score_metric.upper()} for {len(candidates)} candidates "
-            f"by streaming {train_hi - train_lo:,} rows in chunks of {chunk_rows:,} …",
+            f"by streaming {train_hi - train_lo:,} rows in chunks of {chunk_rows:,} "
+            f"(prefilter_metric={self.prefilter_metric}) …",
             flush=True,
         )
         exact = self._exact_score_streaming(
             candidates, store, train_lo, train_hi, chunk_rows
         )
+        if self.prefilter_metric == "exact":
+            exact = self._truncate_exact_per_complexity(exact, per_complexity)
         return self._assemble_front(exact)
 
     # ------------------------------------------------------------------
@@ -1100,13 +1324,24 @@ class NSREngine:
         discovered: dict[tuple[str, ...], _OOCExpr] = {}
         hb = Heartbeat(f"nsr-train lambda={lam:.4g}", interval_s=30.0)
 
+        # Learning is frozen when lr == 0 (the random-search control): sampling
+        # still fills the candidate pool, but the whole policy-gradient/PQT block
+        # is a no-op, so skip it entirely for speed.
+        learning = self.lr > 0.0
+        # A1 EWMA reward baseline and A2 priority queue, both reset per lambda.
+        ewma_baseline: float | None = None
+        pqt_heap: list[tuple[float, int, tuple[str, ...]]] = []
+        pqt_seen: set[tuple[str, ...]] = set()
+        pqt_counter = 0
+
         for iteration in range(self.n_iters):
             step_arrays, step_y, step_score_scale = sample_step()
             step_n = len(step_y)
             step_y_finite = np.isfinite(step_y)
 
             sequences, seq_log_probs, entropies = _sample_batch(
-                policy, lib, self.batch_size, self.max_len, device
+                policy, lib, self.batch_size, self.max_len, device,
+                constrain=self.grammar_constraints,
             )
 
             iter_rewards: dict[tuple[str, ...], float] = {}
@@ -1136,15 +1371,83 @@ class NSREngine:
                 iter_rewards[key] = r
                 rewards.append(r)
 
+            # A2: refresh the priority queue with this batch's unique, valid
+            # sequences, keeping the best ``pqt_k`` by reward.
+            if learning and self.pqt_k > 0:
+                for key, r in iter_rewards.items():
+                    if r <= -0.5 or key in pqt_seen:
+                        continue
+                    if len(pqt_heap) < self.pqt_k:
+                        heapq.heappush(pqt_heap, (r, pqt_counter, key))
+                        pqt_seen.add(key)
+                        pqt_counter += 1
+                    elif r > pqt_heap[0][0]:
+                        _, _, evicted = heapq.heappushpop(
+                            pqt_heap, (r, pqt_counter, key)
+                        )
+                        pqt_seen.discard(evicted)
+                        pqt_seen.add(key)
+                        pqt_counter += 1
+
             rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
             valid = rewards_t > -0.5
-            if int(valid.sum()) >= 2:
+            if learning and int(valid.sum()) >= 2:
+                # Phase-2a curriculum: anneal entropy from ``entropy_weight_start``
+                # down to ``entropy_weight`` (explore early, commit late), and ramp
+                # the PQT weight up from 0 over the first ``pqt_warmup_frac`` of the
+                # run (exploit only once exploration has covered ground).
+                progress = iteration / max(1, self.n_iters - 1)
+                if self.entropy_weight_start is None:
+                    ent_w = self.entropy_weight
+                else:
+                    ent_w = self.entropy_weight_start + (
+                        self.entropy_weight - self.entropy_weight_start
+                    ) * progress
+                if self.pqt_warmup_frac > 0.0:
+                    pqt_w = self.pqt_weight * min(1.0, progress / self.pqt_warmup_frac)
+                else:
+                    pqt_w = self.pqt_weight
+
+                loss = torch.zeros((), device=device)
+
+                # Risk-seeking term (Petersen et al. 2021): reinforce the elite
+                # (1 - elite_frac) quantile against the quantile baseline.
                 q = torch.quantile(rewards_t[valid], 1.0 - self.elite_frac)
                 elite = valid & (rewards_t >= q)
-                advantage = (rewards_t - q).detach()
-                pg_loss = -(advantage[elite] * seq_log_probs[elite]).mean()
-                ent_loss = -entropies[valid].mean()
-                loss = pg_loss + self.entropy_weight * ent_loss
+                adv_q = (rewards_t - q).detach()
+                loss = loss - (adv_q[elite] * seq_log_probs[elite]).mean()
+
+                # A1 dense term: reinforce every above-baseline sample against an
+                # EWMA reward baseline, normalized, so the update is not driven by
+                # a single elite sample at small batch sizes.
+                if self.reinforce_all_valid:
+                    batch_mean = float(rewards_t[valid].mean())
+                    if ewma_baseline is None:
+                        ewma_baseline = batch_mean
+                    else:
+                        ewma_baseline = (
+                            (1.0 - self.ewma_alpha) * ewma_baseline
+                            + self.ewma_alpha * batch_mean
+                        )
+                    adv_b = (rewards_t - ewma_baseline).detach()
+                    std = adv_b[valid].std()
+                    if torch.isfinite(std) and float(std) > 1e-6:
+                        adv_b = adv_b / (std + 1e-6)
+                    loss = loss - (adv_b[valid] * seq_log_probs[valid]).mean()
+
+                # Entropy bonus (annealed).
+                loss = loss - ent_w * entropies[valid].mean()
+
+                # A2 PQT: MLE toward the best sequences discovered so far
+                # (weight ramped in over the warmup).
+                if self.pqt_k > 0 and pqt_heap and pqt_w > 0.0:
+                    pqt_seqs = [list(key) for _, _, key in pqt_heap]
+                    pqt_logp = _sequence_log_probs(
+                        policy, lib, pqt_seqs, self.max_len, device,
+                        constrain=self.grammar_constraints,
+                    )
+                    loss = loss + pqt_w * (-pqt_logp.mean())
+
                 if loss.requires_grad and torch.isfinite(loss):
                     optimizer.zero_grad()
                     loss.backward()
@@ -1170,12 +1473,70 @@ class NSREngine:
     def _prefilter_candidates(
         cands: list[_OOCExpr], per_complexity: int
     ) -> list[_OOCExpr]:
+        """Keep the ``per_complexity`` best candidates per complexity by *approx* score.
+
+        ``_OOCExpr.approx_mse`` holds a subsampled *loss* (already passed through
+        ``_metric_to_loss``), so ascending order is correct for every metric.
+
+        This ranking is noisy: two candidates are compared on different random row
+        subsamples, so the exact-best candidate at a complexity can be evicted here.
+        It is therefore only used as the coarse cap ahead of exact scoring (see
+        ``_select_for_exact_scoring``), or as the whole prefilter under the legacy
+        ``prefilter_metric="approx"`` path.
+        """
         by_c: dict[int, list[_OOCExpr]] = {}
         for c in cands:
             by_c.setdefault(c.complexity, []).append(c)
         kept: list[_OOCExpr] = []
         for group in by_c.values():
             group.sort(key=lambda e: e.approx_mse)
+            kept.extend(group[:per_complexity])
+        return kept
+
+    def _select_for_exact_scoring(
+        self, cands: list[_OOCExpr], per_complexity: int
+    ) -> list[_OOCExpr]:
+        """Choose the candidate set that gets scored exactly on the full dataset.
+
+        Under ``prefilter_metric="approx"`` this is the noisy top-K per complexity
+        (legacy behaviour).  Under ``"exact"`` it is the whole pool, or — when
+        ``exact_prefilter_multiple`` is set — an approx-ranked cap of
+        ``multiple * per_complexity`` per complexity, which bounds the cost of the
+        exact pass on very large datasets.  See the class docstring for what the cap
+        does to the front-preserving guarantee.
+        """
+        if self.prefilter_metric == "approx":
+            return self._prefilter_candidates(cands, per_complexity=per_complexity)
+        if self.exact_prefilter_multiple is None:
+            return cands
+        return self._prefilter_candidates(
+            cands, per_complexity=per_complexity * self.exact_prefilter_multiple
+        )
+
+    def _truncate_exact_per_complexity(
+        self,
+        exact: list[tuple[_OOCExpr, float, float, float]],
+        per_complexity: int,
+    ) -> list[tuple[_OOCExpr, float, float, float]]:
+        """Keep the ``per_complexity`` best-scoring candidates per complexity, exactly ranked.
+
+        Front-preserving: a front member is by definition exact-optimal at its own
+        complexity, so it ranks first in its group and cannot be dropped for any
+        ``per_complexity >= 1``.  Truncating here (rather than before exact scoring)
+        only bounds the cost of the sympy-conversion stage.
+        """
+        by_c: dict[int, list[tuple[_OOCExpr, float, float, float]]] = {}
+        for row in exact:
+            by_c.setdefault(row[0].complexity, []).append(row)
+        kept: list[tuple[_OOCExpr, float, float, float]] = []
+        for group in by_c.values():
+            group.sort(
+                key=lambda r: (
+                    math.inf
+                    if not math.isfinite(r[1])
+                    else _metric_to_loss(r[1], self.score_metric)
+                )
+            )
             kept.extend(group[:per_complexity])
         return kept
 
@@ -1386,7 +1747,20 @@ class NSREngine:
                 mse=score_val,
                 score_metric=self.score_metric,
             )
-            if eq_str not in by_equation or point.score < by_equation[eq_str].score:
+            # Redundant token sequences ("a", "+ a 0", "* a 1", ...) collapse to the
+            # same equation with an identical score, so ties here are common: ~6% of
+            # equations in a typical pool arise at several complexities with zero
+            # score spread.  Breaking those ties on complexity keeps the *simplest*
+            # representation and, critically, makes the result independent of
+            # candidate ordering -- without it the assembled front depends on which
+            # duplicate happens to be visited first, so truncating the pool could
+            # change the front even when truncation preserved the best candidate at
+            # every complexity.
+            incumbent = by_equation.get(eq_str)
+            if incumbent is None or (point.score, point.complexity) < (
+                incumbent.score,
+                incumbent.complexity,
+            ):
                 by_equation[eq_str] = point
 
         if not by_equation:

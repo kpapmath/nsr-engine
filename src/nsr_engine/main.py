@@ -194,6 +194,27 @@ def parse_args() -> argparse.Namespace:
         default="mse",
     )
     engine.add_argument("--prefilter-per-complexity", type=int, default=16)
+    engine.add_argument(
+        "--prefilter-metric",
+        choices=("exact", "approx"),
+        default="exact",
+        help=(
+            "Score that ranks the prefilter. 'exact' scores candidates on the full "
+            "dataset before truncating, so truncation cannot drop a front member. "
+            "'approx' ranks by the noisy subsampled training score (pre-0.4 "
+            "behaviour) and is kept only for reproducing old runs."
+        ),
+    )
+    engine.add_argument(
+        "--exact-prefilter-multiple",
+        type=_none_or_int,
+        default=8,
+        help=(
+            "Cost guard for --prefilter-metric exact: cut the pool to this multiple "
+            "of --prefilter-per-complexity by approx score before exact scoring. "
+            "'none' scores the whole pool (unconditional guarantee, higher cost)."
+        ),
+    )
 
     layers = parser.add_argument_group("accuracy layers")
     _add_bool_arg(
@@ -323,6 +344,8 @@ def _build_engine(args: argparse.Namespace, *, cache_prefix: str | None = None) 
         affine_reward=args.affine_reward,
         score_metric=args.score_metric,
         prefilter_per_complexity=args.prefilter_per_complexity,
+        prefilter_metric=args.prefilter_metric,
+        exact_prefilter_multiple=args.exact_prefilter_multiple,
     )
 
 

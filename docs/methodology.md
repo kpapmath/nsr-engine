@@ -20,8 +20,8 @@ flowchart TD
     H --> E
     E --> I[Collect unique valid candidate token sequences]
     I --> J[Pool candidates across lambdas]
-    J --> K[Prefilter by approximate score per complexity]
-    K --> L[Exact full-set score evaluation]
+    J --> K[Exact full-set score evaluation]
+    K --> L[Truncate by exact score per complexity]
     L --> M[Convert surviving expressions to SymPy]
     M --> N[Dominance filter]
     N --> O[ParetoFront]
@@ -287,7 +287,7 @@ flowchart LR
     P1 --> U[Union by token sequence]
     P2 --> U
     P3 --> U
-    U --> C[Best approximate score per candidate]
+    U --> C[Exact full-set score per candidate]
     C --> F[Final Pareto front]
 ```
 
@@ -297,26 +297,62 @@ The default grid is log-spaced from `lambda_min=1e-4` to `lambda_max=1e-1`.
 
 ## Candidate Reduction and Exact Evaluation
 
-Training uses approximate rewards, often on row subsamples. Before building the
-front, the engine reduces the candidate pool by keeping the lowest approximate
-score candidates within each complexity level. The number kept is controlled by
-`prefilter_per_complexity`.
+Training uses approximate rewards, often on row subsamples. That approximate
+score drives the policy **only** — it never decides front membership.
 
-After prefiltering, candidates are evaluated exactly on the complete in-memory
-training set, or by streaming the requested memmap row range in chunks.
+Candidates are evaluated exactly on the complete in-memory training set (or by
+streaming the requested memmap row range in chunks) *before* the pool is reduced
+to `prefilter_per_complexity` candidates per complexity. Reducing on the exact
+score is what makes the reduction **front-preserving**.
 
 ```mermaid
 flowchart TD
-    A[All discovered candidates] --> B[Group by token count]
-    B --> C[Sort each group by approximate score]
-    C --> D[Keep top K per complexity]
-    D --> E[Evaluate exact score]
-    E --> F[Convert to affine SymPy expression]
-    F --> G[Deduplicate by equation string]
+    A[All discovered candidates] --> B[Optional cost cap by approximate score]
+    B --> C[Evaluate exact score on the full row range]
+    C --> D[Group by token count]
+    D --> E[Sort each group by exact score]
+    E --> F[Keep top K per complexity]
+    F --> G[Convert to affine SymPy expression]
+    G --> H[Deduplicate by equation string]
 ```
 
-This design keeps exact evaluation focused on candidates that have already
-shown promise while preserving diversity across expression sizes.
+### Why the ordering matters
+
+A Pareto-front member is, by definition, exact-optimal at its own complexity. So
+when the groups are sorted by exact score it ranks first and survives any
+`K >= 1`: truncation provably cannot drop a front member.
+
+Sorting by the *approximate* score has no such property. Two candidates are
+compared on different random row subsamples, so sampling noise can rank the
+exact-best candidate below the cut and silently perturb the front. This was the
+behaviour before v0.4 and is still reachable via `prefilter_metric="approx"`,
+retained only for reproducing or profiling old runs.
+
+`tests/test_deferred_equals_naive.py` asserts both halves: the exact path
+reproduces a naive score-everything loop element-wise, and the approx path
+demonstrably does not.
+
+### Two distinct properties
+
+These are separate claims and should not be conflated:
+
+| Property | Meaning | Guaranteed by |
+|---|---|---|
+| **Front-preserving** | The deferred pipeline returns the same front as scoring every candidate on the full dataset. | Exact-ranked truncation (`prefilter_metric="exact"`). |
+| **Numeric determinism** | Re-running the same configuration reproduces the same numbers. | float32 evaluation, float64 scoring, fixed seeds. |
+
+### Cost of exactness
+
+Exact scoring is a full pass over the data per candidate, and the raw pool
+typically runs 10–15× larger than the kept set. On large row counts, scoring the
+entire pool can dominate the fit. `exact_prefilter_multiple` (default `8`) caps
+the exactly-scored set at that multiple of `prefilter_per_complexity` per
+complexity, cutting by approximate score first.
+
+With a finite cap the guarantee is *conditional*: it holds provided the true
+front member survives a cut that is `m` times looser than the final one. Set
+`exact_prefilter_multiple=None` to score the whole pool and make the guarantee
+unconditional, at proportionally higher cost.
 
 ## Pareto Front Construction
 

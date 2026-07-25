@@ -9,8 +9,11 @@ venv/
 *.mmap.meta.json
 *.xml
 *.iml
+*.csv
+*.log
 nsr_cache/
 .pytest_cache/
 .mypy_cache/
+benchmarks/results/
 **/src/nsr_engine.egg-info
 **/nsr_publication.md

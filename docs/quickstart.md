@@ -178,7 +178,9 @@ The CLI exposes data, split, engine, and accuracy-layer options.
 | `--standardize` / `--no-standardize` | `True` | Enable or disable feature z-scoring. |
 | `--affine-reward` / `--no-affine-reward` | `True` | Enable or disable least-squares affine scoring. |
 | `--metric`, `--score-metric` | `"mse"` | Score metric passed to `NSREngine`. |
-| `--prefilter-per-complexity` | `16` | Approximate-score candidates kept per complexity before exact evaluation. |
+| `--prefilter-per-complexity` | `16` | Candidates kept per complexity, ranked by exact score, before SymPy conversion. |
+| `--prefilter-metric` | `exact` | `exact` truncates on full-dataset scores (front-preserving); `approx` is the pre-0.4 behaviour. |
+| `--exact-prefilter-multiple` | `8` | Caps the exactly-scored pool at this multiple of `--prefilter-per-complexity`; `none` scores everything. |
 | `--boosting` / `--no-boosting` | `False` | Accuracy layer 1. Fit additive terms by re-running the engine on each round's residual. |
 | `--boosting-max-rounds` | `3` | Hard cap on the number of additive terms. |
 | `--boosting-min-gain` | `0.02` | Minimum relative training-MSE improvement for a round to be kept. |
@@ -274,7 +276,9 @@ These are the constructor arguments accepted by `NSREngine(...)`.
 | `standardize` | `True` | Whether feature columns are z-scored before training. Returned SymPy formulas are converted back to raw feature terms when possible. |
 | `affine_reward` | `True` | Whether rewards and final scoring use a least-squares affine fit `b0 + b1 * expression` before applying `score_metric`. This makes scoring less sensitive to expression scale and offset. |
 | `score_metric` | `"mse"` | Accuracy metric. Supported values are `"mse"`, `"rmse"`, `"mae"`, `"mape"`, `"mbd"`, `"r2"`, and `"adjusted_r2"`. |
-| `prefilter_per_complexity` | `16` | Number of best approximate-score candidates to keep per complexity before exact full-set evaluation. |
+| `prefilter_per_complexity` | `16` | Number of best candidates to keep per complexity, ranked by exact full-set score, before SymPy conversion. |
+| `prefilter_metric` | `"exact"` | `"exact"` ranks the prefilter on full-dataset scores, so truncation provably cannot drop a front member. `"approx"` ranks on the noisy subsampled training score (pre-0.4 behaviour), retained for reproducing old runs. |
+| `exact_prefilter_multiple` | `8` | Caps the exactly-scored pool at this multiple of `prefilter_per_complexity` per complexity. `None` scores the entire pool, making the guarantee unconditional at higher cost. |
 
 ### Score Metric Values
 

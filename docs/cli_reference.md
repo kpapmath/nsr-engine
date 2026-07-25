@@ -102,7 +102,9 @@ python main.py --unary-ops square,abs,log,sqrt,sin,cos,tanh --metric r2
 | `--standardize` / `--no-standardize` | `True` | Flag | Enable or disable feature z-scoring. |
 | `--affine-reward` / `--no-affine-reward` | `True` | Flag | Enable or disable least-squares affine scoring. |
 | `--metric`, `--score-metric` | `"mse"` | `"mse"`, `"rmse"`, `"mae"`, `"mape"`, `"mbd"`, `"r2"`, `"adjusted_r2"` | Accuracy metric. See [Score metric values](#score-metric-values). |
-| `--prefilter-per-complexity` | `16` | Any positive integer | Approximate-score candidates kept per complexity before exact evaluation. |
+| `--prefilter-per-complexity` | `16` | Any positive integer | Candidates kept per complexity, ranked by exact score, before SymPy conversion. |
+| `--prefilter-metric` | `exact` | `exact`, `approx` | Score that ranks the prefilter. `exact` scores candidates on the full dataset before truncating, so truncation cannot drop a front member. `approx` is the pre-0.4 behaviour and is kept only for reproducing old runs. |
+| `--exact-prefilter-multiple` | `8` | Positive integer or `none` | Cost guard for `--prefilter-metric exact`: cut the pool to this multiple of `--prefilter-per-complexity` by approximate score before exact scoring. `none` scores the whole pool for an unconditional guarantee. |
 
 ## Accuracy layer arguments
 
