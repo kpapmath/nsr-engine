@@ -316,6 +316,24 @@ def _affine_residual(
     Returns ``(residual_mse, b0, b1)`` over the finite-aligned rows, or ``None``
     if fewer than two valid rows.  Making the reward invariant to the scale and
     offset of ``pred`` lets a feature on any scale compete on correlation alone.
+
+    This is **linear scaling** in the sense of Keijzer (2003) and is the same
+    scaling Operon (Burlacu et al., 2020) applies inside its evolutionary
+    fitness -- it is not original to this method.  The residual of the optimal
+    affine fit is ``mse* = Var(y)*(1 - r^2)`` with ``r`` the Pearson correlation
+    between ``pred`` and ``y``, so the inverse-normalised-MSE reward reduces to a
+    strictly monotone function of ``r^2``::
+
+        R = 1 / (1 + mse*/Var(y)) = 1 / (2 - r^2).
+
+    The reward therefore ranks candidates purely by squared correlation; scale
+    and offset are recovered for free by ``(b0, b1)`` and never have to be
+    discovered by the search.
+
+    References:
+        Keijzer, M. (2003). Improving symbolic regression with interval
+        arithmetic and linear scaling. EuroGP 2003.
+        Burlacu, Kronberger, Kommenda (2020). Operon C++. GECCO 2020 Companion.
     """
     n = pred.size
     if n < 2:
@@ -883,7 +901,12 @@ class NSREngine:
         likelihood each step.  ``0`` disables PQT.
     pqt_weight:
         Target weight of the PQT MLE loss term relative to the policy-gradient
-        loss (reached after the warmup, see ``pqt_warmup_frac``).
+        loss (reached after the warmup, see ``pqt_warmup_frac``).  Defaults to
+        ``0.5``: the PQT pull on the policy is *non-monotonic* in stability --
+        a full weight of ``1.0`` can drive some seeds into a collapsed, worse
+        basin, while ``0.0`` (no PQT) is also unstable, and ``0.5`` is the
+        empirically robust middle ground that rescues collapse-prone runs
+        without harming healthy ones.  (Prior releases defaulted to ``1.0``.)
     entropy_weight_start:
         Phase-2a exploration curriculum.  Initial entropy-bonus coefficient,
         linearly annealed to ``entropy_weight`` over each lambda's iterations, so
@@ -896,6 +919,25 @@ class NSREngine:
         0; only its pull on the policy is delayed, which stops PQT from locking
         onto an early, suboptimal basin before exploration has covered ground.
         ``0.0`` applies full PQT weight immediately.
+    entropy_floor:
+        Stability control against policy collapse.  Clamps the (possibly annealed)
+        entropy-bonus coefficient so it never drops below this value, keeping the
+        sampler exploratory late in training.  Without a floor the risk-seeking and
+        PQT terms can drive the policy to a near-deterministic, low-entropy
+        distribution that over-commits to a poor basin; a floor counteracts that.
+        ``None`` (default) imposes no floor, reproducing the pre-existing behaviour.
+    restarts_per_lambda:
+        Stability control against unlucky single runs.  Trains this many independent
+        policies per lambda (each from a distinct seed) and pools their discovered
+        expressions, keeping the best per token sequence.  Because a collapsed run's
+        pool is unioned with the others', one bad restart no longer erases a lambda's
+        contribution.  ``1`` (default) is the original single-run behaviour and the
+        seed of that run is unchanged, so results are byte-for-byte reproducible.
+        Cost scales linearly with this value.
+    grad_clip_norm:
+        Max global gradient-norm for policy updates (``clip_grad_norm_``).  Previously
+        hard-coded to ``1.0``; exposed so the clip that bounds a single noisy REINFORCE
+        step can be tightened for extra stability.  Defaults to ``1.0`` (unchanged).
     """
 
     def __init__(
@@ -923,6 +965,7 @@ class NSREngine:
         step_subsample_size: int | None = None,
         standardize: bool = True,
         affine_reward: bool = True,
+        count_affine_wrapper: bool = False,
         score_metric: str = "mse",
         prefilter_per_complexity: int = 16,
         prefilter_metric: str = "exact",
@@ -931,9 +974,12 @@ class NSREngine:
         reinforce_all_valid: bool = True,
         ewma_alpha: float = 0.1,
         pqt_k: int = 10,
-        pqt_weight: float = 1.0,
+        pqt_weight: float = 0.5,
         entropy_weight_start: float | None = 0.02,
         pqt_warmup_frac: float = 0.3,
+        entropy_floor: float | None = None,
+        restarts_per_lambda: int = 1,
+        grad_clip_norm: float = 1.0,
     ) -> None:
         if not _TORCH_AVAILABLE:
             raise ImportError(
@@ -951,6 +997,12 @@ class NSREngine:
             )
         if not 0.0 <= pqt_warmup_frac <= 1.0:
             raise ValueError(f"pqt_warmup_frac must be in [0, 1] (got {pqt_warmup_frac})")
+        if entropy_floor is not None and entropy_floor < 0.0:
+            raise ValueError(f"entropy_floor must be >= 0 or None (got {entropy_floor})")
+        if restarts_per_lambda < 1:
+            raise ValueError(f"restarts_per_lambda must be >= 1 (got {restarts_per_lambda})")
+        if grad_clip_norm <= 0.0:
+            raise ValueError(f"grad_clip_norm must be > 0 (got {grad_clip_norm})")
         score_metric = score_metric.lower()
         if score_metric not in _SCORE_METRICS:
             supported = ", ".join(repr(m) for m in _SCORE_METRICS)
@@ -995,6 +1047,7 @@ class NSREngine:
         self.step_subsample_size = step_subsample_size
         self.standardize = standardize
         self.affine_reward = affine_reward
+        self.count_affine_wrapper = count_affine_wrapper
         self.score_metric = score_metric
         self.prefilter_per_complexity = prefilter_per_complexity
         self.prefilter_metric = prefilter_metric
@@ -1006,6 +1059,9 @@ class NSREngine:
         self.pqt_weight = pqt_weight
         self.entropy_weight_start = entropy_weight_start
         self.pqt_warmup_frac = pqt_warmup_frac
+        self.entropy_floor = entropy_floor
+        self.restarts_per_lambda = restarts_per_lambda
+        self.grad_clip_norm = grad_clip_norm
         self._feat_mean: dict[str, float] | None = None
         self._feat_std: dict[str, float] | None = None
 
@@ -1286,13 +1342,30 @@ class NSREngine:
                 print(f"[nsr]   loaded {len(cached)} candidates from cache", flush=True)
                 discovered = cached
             else:
-                discovered = self._train_one_lambda(
-                    lam=lam,
-                    lib=lib,
-                    sample_step=sample_step,
-                    device=device,
-                    seed=self.random_state + i,
-                )
+                # Restart stability: train ``restarts_per_lambda`` independent policies
+                # and union their pools (best approx score per token sequence), so a
+                # single collapsed run cannot erase this lambda's contribution.  The
+                # first restart keeps seed ``random_state + i`` exactly, so with the
+                # default ``restarts_per_lambda == 1`` results are unchanged.  Restart
+                # seeds are offset by whole grid-widths to stay collision-free.
+                n_lam = len(self.lambda_grid)
+                discovered = {}
+                for r in range(self.restarts_per_lambda):
+                    if self.restarts_per_lambda > 1:
+                        print(
+                            f"[nsr]   restart {r + 1}/{self.restarts_per_lambda}",
+                            flush=True,
+                        )
+                    run = self._train_one_lambda(
+                        lam=lam,
+                        lib=lib,
+                        sample_step=sample_step,
+                        device=device,
+                        seed=self.random_state + i + r * n_lam,
+                    )
+                    for key, expr in run.items():
+                        if key not in discovered or expr.approx_mse < discovered[key].approx_mse:
+                            discovered[key] = expr
                 print(
                     f"[nsr]   found {len(discovered)} unique valid expressions",
                     flush=True,
@@ -1403,6 +1476,8 @@ class NSREngine:
                     ent_w = self.entropy_weight_start + (
                         self.entropy_weight - self.entropy_weight_start
                     ) * progress
+                if self.entropy_floor is not None:
+                    ent_w = max(ent_w, self.entropy_floor)
                 if self.pqt_warmup_frac > 0.0:
                     pqt_w = self.pqt_weight * min(1.0, progress / self.pqt_warmup_frac)
                 else:
@@ -1451,7 +1526,7 @@ class NSREngine:
                 if loss.requires_grad and torch.isfinite(loss):
                     optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                    nn.utils.clip_grad_norm_(policy.parameters(), self.grad_clip_norm)
                     optimizer.step()
 
             valid_np = np.array(rewards)
@@ -1740,10 +1815,19 @@ class NSREngine:
             if converted is None:
                 continue
             eq_str, sympy_expr = converted
+            complexity = cand.complexity
+            if self.count_affine_wrapper and self.affine_reward:
+                # Charge the affine wrapper b0 + b1*(.) the tree nodes a GP engine
+                # would spend on it: +1 for a non-unit slope, +1 for a non-zero
+                # intercept. Restores strict cross-engine complexity comparability.
+                if abs(b1 - 1.0) > 1e-9:
+                    complexity += 1
+                if abs(b0) > 1e-9:
+                    complexity += 1
             point = ParetoPoint(
                 equation=eq_str,
                 sympy_expr=sympy_expr,
-                complexity=cand.complexity,
+                complexity=complexity,
                 mse=score_val,
                 score_metric=self.score_metric,
             )

@@ -306,3 +306,41 @@ def evaluate_with_sympy(equation: object, X: pd.DataFrame, y: pd.Series) -> floa
         return None
 
     return rmse(y.to_numpy(dtype=np.float64)[mask], pred[mask])
+
+
+def select_on_validation(
+    front: object,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    *,
+    baseline_rmse: float | None = None,
+):
+    """R4: choose an operating point using validation data only.
+
+    Stability filter + operating-point choice, kept off the test set. Each front
+    point is scored on ``(X_val, y_val)``; points whose validation RMSE does not
+    beat the mean-predictor baseline (RMSE of always predicting ``mean(y_val)``)
+    are dropped, and the elbow of the survivors is returned. ``elbow()`` itself is
+    unchanged — this wraps it. Returns the selected ``ParetoPoint``, or ``None``
+    if no point beats the baseline.
+
+    Test data must never be passed here; selection and stability filtering see
+    validation only, and the test split is scored exactly once, elsewhere.
+    """
+    from .pareto import ParetoFront
+
+    y_arr = np.asarray(y_val, dtype=np.float64)
+    if baseline_rmse is None:
+        baseline_rmse = rmse(y_arr, np.full_like(y_arr, float(np.mean(y_arr))))
+
+    survivors = []
+    for point in getattr(front, "points", []):
+        val_rmse = evaluate_with_sympy(point.sympy_expr, X_val, pd.Series(y_arr))
+        if val_rmse is None:
+            continue
+        if val_rmse < baseline_rmse:
+            survivors.append(point)
+
+    if not survivors:
+        return None
+    return ParetoFront(survivors).elbow()

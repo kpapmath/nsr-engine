@@ -162,6 +162,14 @@ def parse_args() -> argparse.Namespace:
     engine.add_argument("--max-len", type=int, default=15)
     engine.add_argument("--elite-frac", type=float, default=0.05)
     engine.add_argument("--entropy-weight", type=float, default=0.005)
+    engine.add_argument("--entropy-floor", type=float, default=None,
+                        help="Floor on the (annealed) entropy coefficient; guards "
+                             "against policy collapse. Default: no floor.")
+    engine.add_argument("--restarts-per-lambda", type=int, default=1,
+                        help="Independent policy restarts per lambda, pools unioned; "
+                             "makes a lambda robust to a single collapsed run.")
+    engine.add_argument("--grad-clip-norm", type=float, default=1.0,
+                        help="Max global grad-norm per policy update.")
     engine.add_argument("--hidden-dim", type=int, default=128)
     engine.add_argument("--embed-dim", type=int, default=32)
     engine.add_argument("--lr", type=float, default=1e-3)
@@ -186,6 +194,15 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help_text="Score expressions after least-squares affine fitting.",
         disable_help_text="Score raw expression predictions without affine fitting.",
+    )
+    _add_bool_arg(
+        engine,
+        "count_affine_wrapper",
+        default=False,
+        help_text="Charge the affine wrapper b0+b1*(.) +1/+2 complexity for a "
+        "non-unit slope / non-zero intercept (cross-engine comparability).",
+        disable_help_text="Do not count the affine wrapper toward complexity "
+        "(default).",
     )
     engine.add_argument(
         "--metric",
@@ -329,6 +346,9 @@ def _build_engine(args: argparse.Namespace, *, cache_prefix: str | None = None) 
         max_len=args.max_len,
         elite_frac=args.elite_frac,
         entropy_weight=args.entropy_weight,
+        entropy_floor=args.entropy_floor,
+        restarts_per_lambda=args.restarts_per_lambda,
+        grad_clip_norm=args.grad_clip_norm,
         hidden_dim=args.hidden_dim,
         embed_dim=args.embed_dim,
         lr=args.lr,
@@ -342,6 +362,7 @@ def _build_engine(args: argparse.Namespace, *, cache_prefix: str | None = None) 
         step_subsample_size=args.step_subsample_size,
         standardize=args.standardize,
         affine_reward=args.affine_reward,
+        count_affine_wrapper=args.count_affine_wrapper,
         score_metric=args.score_metric,
         prefilter_per_complexity=args.prefilter_per_complexity,
         prefilter_metric=args.prefilter_metric,
