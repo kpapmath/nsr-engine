@@ -1201,24 +1201,43 @@ class NSREngine:
             self.step_subsample_size is not None
             and self.step_subsample_size < n_rows
         )
-        all_indices = np.arange(n_rows)
         y_score_scale_full = _target_metric_scale(y_arr[np.isfinite(y_arr)], self.score_metric)
+
+        # Per-iteration row draw.  ``np.random.choice(arr, k, replace=False)`` is
+        # O(n_rows): it permutes the entire index array to take k of them.  At
+        # multi-million-row scale that costs more than the expression evaluations
+        # it exists to feed -- ~390 ms per draw at 6M rows, i.e. ~70 s of a
+        # 180-iteration sweep spent shuffling indices.  ``Generator.choice`` uses
+        # Floyd's algorithm for the same without-replacement semantics and is
+        # ~200x faster.  Seeded from ``random_state`` so the draw sequence stays
+        # reproducible; ``fit_memmap`` already avoided the O(n) call.
+        subsample_rng = np.random.default_rng(self.random_state)
+
+        # Stratified draws need each cell's row indices.  Recomputing them from a
+        # boolean mask inside the closure would be a further O(n_rows) pass *per
+        # cell per iteration*, so they are materialised once.
+        regime_cell_indices: list[np.ndarray] | None = None
+        if subsample and subsample_regime_ids is not None:
+            regime_cell_indices = [
+                np.flatnonzero(subsample_regime_ids == cell)
+                for cell in np.unique(subsample_regime_ids)
+            ]
 
         def sample_step() -> tuple[dict[str, np.ndarray], np.ndarray, float]:
             if not subsample:
                 return arrays, y_arr, y_score_scale_full
             k = self.step_subsample_size or n_rows
-            if subsample_regime_ids is not None:
-                cells = np.unique(subsample_regime_ids)
-                n_per_cell = max(1, k // len(cells))
+            if regime_cell_indices is not None:
+                n_per_cell = max(1, k // len(regime_cell_indices))
                 parts: list[np.ndarray] = []
-                for cell in cells:
-                    cell_idx = all_indices[subsample_regime_ids == cell]
+                for cell_idx in regime_cell_indices:
                     take = min(n_per_cell, len(cell_idx))
-                    parts.append(np.random.choice(cell_idx, size=take, replace=False))
+                    parts.append(
+                        subsample_rng.choice(cell_idx, size=take, replace=False)
+                    )
                 idx = np.concatenate(parts)
             else:
-                idx = np.random.choice(all_indices, size=k, replace=False)
+                idx = subsample_rng.choice(n_rows, size=k, replace=False)
             step_arrays = {col: arr[idx] for col, arr in arrays.items()}
             step_y = y_arr[idx]
             finite_y = step_y[np.isfinite(step_y)]
