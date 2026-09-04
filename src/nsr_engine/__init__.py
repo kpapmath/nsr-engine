@@ -14,4 +14,4 @@ __all__ = [
     "optimize_front",
     "joint_refit_prune",
 ]
-__version__ = "0.5.0"
+__version__ = "0.6.0"
