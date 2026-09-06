@@ -34,6 +34,7 @@ from nsr_engine.pareto import ParetoFront, ParetoPoint
 __all__ = ["ResidualBoostedNSR"]
 
 _TERM_SELECTIONS = ("elbow", "min_mse")
+_RESIDUAL_METRICS = ("mse", "rmse")
 
 
 class ResidualBoostedNSR:
@@ -62,6 +63,18 @@ class ResidualBoostedNSR:
         ``"elbow"`` keeps each term compact; ``"min_mse"`` takes the most
         accurate point of the round's front, recovering more per round when
         parsimony is not the priority.
+    residual_metric:
+        Objective the round-acceptance rule is measured in, ``"mse"`` (default,
+        the historical behaviour) or ``"rmse"``.  It sets what ``min_gain`` is a
+        fraction *of* and what the emitted points report as their score, so a
+        caller running the weak learner under ``score_metric="rmse"`` can make
+        the booster agree with it instead of mixing the two.
+
+        The two are monotonically related, so they never disagree about which
+        round is *better* -- only about how large the improvement looks:
+        ``gain_rmse = 1 - sqrt(1 - gain_mse)``.  A ``min_gain`` of 0.02 in MSE
+        is 0.01 in RMSE; passing the same number under both metrics tightens
+        the threshold rather than preserving it.
 
     Attributes
     ----------
@@ -80,19 +93,36 @@ class ResidualBoostedNSR:
         term_refiner: Callable[..., Any] | None = None,
         *,
         term_selection: str = "elbow",
+        residual_metric: str = "mse",
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be at least 1")
         if term_selection not in _TERM_SELECTIONS:
             supported = ", ".join(repr(s) for s in _TERM_SELECTIONS)
             raise ValueError(f"term_selection must be one of: {supported}")
+        residual_metric = residual_metric.lower()
+        if residual_metric not in _RESIDUAL_METRICS:
+            supported = ", ".join(repr(s) for s in _RESIDUAL_METRICS)
+            raise ValueError(f"residual_metric must be one of: {supported}")
         self.engine_factory = engine_factory
         self.max_rounds = max_rounds
         self.min_gain = min_gain
         self.term_refiner = term_refiner
         self.term_selection = term_selection
+        self.residual_metric = residual_metric
         self.rounds_: list[dict[str, Any]] = []
         self.terms_: list[tuple[Any, int]] = []
+
+    def _score_of(self, residual: np.ndarray) -> float:
+        """Residual objective, in whichever metric ``residual_metric`` names.
+
+        ``mse_of`` ignores non-finite entries, so rows where the model is
+        undefined drop out of the score exactly as they do in the engine.
+        """
+        value = mse_of(residual)
+        if self.residual_metric == "rmse":
+            return float(np.sqrt(value))
+        return value
 
     def _pick_term(self, front: ParetoFront) -> ParetoPoint | None:
         """Best MSE-drop-per-complexity term of the round's front."""
@@ -132,6 +162,7 @@ class ResidualBoostedNSR:
                         "gain": 0.0,
                         "term": None,
                         "cum_mse": mse_of(residual),
+                        "cum_score": self._score_of(residual),
                     }
                 )
                 break
@@ -156,22 +187,22 @@ class ResidualBoostedNSR:
                         "gain": 0.0,
                         "term": expr,
                         "cum_mse": mse_of(residual),
+                        "cum_score": self._score_of(residual),
                     }
                 )
                 break
 
-            prev_mse = mse_of(residual)
+            prev_score = self._score_of(residual)
             new_pred = model_pred + pred
-            # mse_of ignores non-finite residuals, so rows where the model is
-            # undefined drop out of the score, as they do in the engine.
-            new_mse = mse_of(y_arr - new_pred)
+            new_resid = y_arr - new_pred
+            new_score = self._score_of(new_resid)
             gain = (
-                (prev_mse - new_mse) / prev_mse
-                if np.isfinite(prev_mse) and prev_mse > 0.0
+                (prev_score - new_score) / prev_score
+                if np.isfinite(prev_score) and prev_score > 0.0
                 else 0.0
             )
 
-            if not np.isfinite(new_mse):
+            if not np.isfinite(new_score):
                 self.rounds_.append(
                     {
                         "round": k,
@@ -179,7 +210,8 @@ class ResidualBoostedNSR:
                         "reason": "model scored no finite rows",
                         "gain": 0.0,
                         "term": expr,
-                        "cum_mse": prev_mse,
+                        "cum_mse": mse_of(residual),
+                        "cum_score": prev_score,
                     }
                 )
                 break
@@ -194,13 +226,14 @@ class ResidualBoostedNSR:
                         "reason": f"gain {gain:.4f} < min_gain {self.min_gain}",
                         "gain": gain,
                         "term": expr,
-                        "cum_mse": prev_mse,
+                        "cum_mse": mse_of(residual),
+                        "cum_score": prev_score,
                     }
                 )
                 break
 
             model_pred = new_pred
-            residual = y_arr - model_pred
+            residual = new_resid
             model_expr = expr if model_expr is None else model_expr + expr
             self.terms_.append((expr, int(term.complexity)))
 
@@ -213,8 +246,8 @@ class ResidualBoostedNSR:
                     equation=str(model_expr),
                     sympy_expr=model_expr,
                     complexity=complexity,
-                    mse=new_mse,
-                    score_metric="mse",
+                    mse=new_score,
+                    score_metric=self.residual_metric,
                 )
             )
             self.rounds_.append(
@@ -224,10 +257,11 @@ class ResidualBoostedNSR:
                     "reason": "kept",
                     "gain": gain,
                     "term": expr,
-                    "cum_mse": new_mse,
+                    "cum_mse": mse_of(new_resid),
+                    "cum_score": new_score,
                 }
             )
 
-        # Non-dominated by construction: complexity strictly increases and
-        # training MSE strictly decreases on every kept round.
+        # Non-dominated by construction: complexity strictly increases and the
+        # training residual metric strictly decreases on every kept round.
         return ParetoFront(points)

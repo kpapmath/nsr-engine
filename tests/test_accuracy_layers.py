@@ -539,3 +539,117 @@ def test_joint_refit_ols_estimator_runs():
     refined = joint_refit_prune(terms, X, y, estimator="ols")
 
     assert refined is not None
+
+
+# ---------------------------------------------------------------------------
+# residual_metric: the objective the round-acceptance rule is measured in
+# ---------------------------------------------------------------------------
+def test_residual_metric_defaults_to_mse():
+    """The default must not move: existing callers and the CLI rely on it."""
+    assert ResidualBoostedNSR(_two_term_factory).residual_metric == "mse"
+    front = ResidualBoostedNSR(_two_term_factory).fit(*_make_data())
+    assert {p.score_metric for p in front.points} == {"mse"}
+
+
+def test_invalid_residual_metric_is_rejected():
+    with pytest.raises(ValueError, match="residual_metric"):
+        ResidualBoostedNSR(_two_term_factory, residual_metric="mape")
+
+
+def test_rmse_residual_metric_labels_and_scores_in_rmse():
+    """Under `residual_metric="rmse"` the emitted points must report RMSE.
+
+    A point labelled `mse` while carrying an RMSE value (or the reverse) is the
+    silent failure this guards: `ParetoPoint.score` negates for r2-like metrics
+    and downstream selection compares the numbers directly.
+    """
+    X, y = _make_data()
+    booster = ResidualBoostedNSR(_two_term_factory, residual_metric="rmse")
+    front = booster.fit(X, y)
+    assert {p.score_metric for p in front.points} == {"rmse"}
+    # `cum_score` is the RMSE of the same residual `cum_mse` is the MSE of.
+    for r in booster.rounds_:
+        assert r["cum_score"] == pytest.approx(np.sqrt(r["cum_mse"]))
+
+
+def test_both_metrics_keep_the_same_rounds_under_a_converted_min_gain():
+    """MSE and RMSE gains are monotonically related, so with `min_gain`
+    converted by `gain_rmse = 1 - sqrt(1 - gain_mse)` the two modes must accept
+    exactly the same rounds. Otherwise switching metric silently changes how
+    many terms the model gets."""
+    X, y = _make_data()
+    mse_gain = 0.02
+    rmse_gain = 1.0 - np.sqrt(1.0 - mse_gain)
+
+    a = ResidualBoostedNSR(_two_term_factory, min_gain=mse_gain)
+    b = ResidualBoostedNSR(_two_term_factory, min_gain=rmse_gain,
+                           residual_metric="rmse")
+    a.fit(X, y)
+    b.fit(X, y)
+    assert [r["added"] for r in a.rounds_] == [r["added"] for r in b.rounds_]
+    assert len(a.terms_) == len(b.terms_)
+    # Same terms, not merely the same count.
+    assert [str(t) for t, _ in a.terms_] == [str(t) for t, _ in b.terms_]
+
+
+# ---------------------------------------------------------------------------
+# _bounded_simplify: `sympy.simplify` must not be able to hang a fit
+# ---------------------------------------------------------------------------
+def test_bounded_simplify_matches_plain_simplify_when_it_is_fast():
+    """The bound must be invisible for every call that already completed.
+
+    Normal expressions simplify in well under a second, so the guard has to be
+    a pure pass-through for them -- otherwise it would change results that were
+    never broken.
+    """
+    import sympy as sp
+
+    from nsr_engine.engine import _bounded_simplify
+
+    a, b = sp.symbols("a b")
+    for expr in (sp.Float(0.5) + sp.Float(2.0) * (a - sp.Float(0.1)) / sp.Float(1.7),
+                 sp.sqrt(sp.Abs(a * b)) + a ** 2 - sp.Float(0.75) * b,
+                 (a + b) ** 2 - a ** 2 - 2 * a * b):
+        assert _bounded_simplify(expr) == sp.simplify(expr)
+
+
+def test_bounded_simplify_returns_the_input_when_it_runs_long(monkeypatch):
+    """On timeout it falls back to the unsimplified expression.
+
+    That is the same fallback the callers already take when `simplify` raises:
+    the expression is mathematically identical, it merely reads less tidily.
+    Without this, one pathological candidate can burn the whole fit -- measured
+    at 20% of fits exceeding a 1800 s cap on a 10-feature search.
+    """
+    import time
+
+    import sympy as sp
+
+    from nsr_engine import engine as _engine
+
+    monkeypatch.setenv("NSR_SIMPLIFY_TIMEOUT_S", "0.25")
+    monkeypatch.setattr(sp, "simplify", lambda e, **kw: time.sleep(30))
+
+    expr = sp.Symbol("a") + sp.Float(1.0)
+    t0 = time.perf_counter()
+    got = _engine._bounded_simplify(expr)
+    elapsed = time.perf_counter() - t0
+
+    assert got == expr, "should hand back the untouched expression"
+    assert elapsed < 5.0, f"the bound did not fire (took {elapsed:.1f}s)"
+
+
+def test_bounded_simplify_restores_the_previous_signal_handler():
+    """The guard must not leave SIGALRM pointing at its own handler, or an
+    unrelated alarm elsewhere in the process would raise TimeoutError."""
+    import signal
+
+    import sympy as sp
+
+    from nsr_engine.engine import _bounded_simplify
+
+    before = signal.getsignal(signal.SIGALRM)
+    _bounded_simplify(sp.Symbol("a") + sp.Float(1.0))
+    assert signal.getsignal(signal.SIGALRM) is before
+    # And no timer is left armed.
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)

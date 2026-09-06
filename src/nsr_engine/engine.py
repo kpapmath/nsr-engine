@@ -446,6 +446,67 @@ def _target_metric_scale(y: np.ndarray, metric: str) -> float:
 # Sympy conversion (runs only for surviving candidates, never in training)
 # ---------------------------------------------------------------------------
 
+# Wall-clock bound on `sympy.simplify`, in seconds. Overridable with
+# NSR_SIMPLIFY_TIMEOUT_S.
+#
+# `simplify` is cosmetic here: it canonicalises the expression that gets printed
+# and stored, and never changes what the model predicts. But on a small fraction
+# of sampled expressions it rationalises the fitted floats into fractions with
+# 50-digit numerators and then tries to factor them -- `Rational._eval_power` ->
+# `perfect_power` -> `factorint` -> Miller-Rabin -- and a single candidate can
+# then burn half an hour. Measured on a 10-feature search with `sqrt`/`sin`,
+# 20% of fits exceeded a 1800 s cap this way while the median fit took 28 s.
+#
+# A typical simplify on these expressions takes 0.06-0.22 s, so this bound is
+# ~25x headroom: it cannot change the result of any call that was already
+# completing, only cap the ones that were not.
+_SIMPLIFY_TIMEOUT_S = 5.0
+
+
+def _bounded_simplify(expr: Any) -> Any:
+    """``sympy.simplify(expr)``, or the expression unchanged if it takes too long.
+
+    Returning the input on timeout is the same fallback the callers already use
+    when ``simplify`` raises -- an unsimplified expression is mathematically
+    identical and merely reads less tidily.
+
+    The bound uses ``SIGALRM``, which is only available on POSIX and only from
+    the main thread.  Where it is not, the call runs unbounded rather than
+    silently doing something different; the benchmark harness runs each fit in
+    its own process's main thread, so it is bounded there.
+    """
+    import os
+    import signal
+
+    import sympy as sp
+
+    try:
+        limit = float(os.environ.get("NSR_SIMPLIFY_TIMEOUT_S", _SIMPLIFY_TIMEOUT_S))
+    except ValueError:
+        limit = _SIMPLIFY_TIMEOUT_S
+
+    if limit <= 0 or not hasattr(signal, "SIGALRM"):
+        return sp.simplify(expr)
+
+    def _raise(signum, frame):  # noqa: ANN001
+        raise TimeoutError("simplify exceeded its budget")
+
+    try:
+        previous = signal.signal(signal.SIGALRM, _raise)
+    except ValueError:
+        # Not the main thread: signals are unavailable here.
+        return sp.simplify(expr)
+
+    try:
+        signal.setitimer(signal.ITIMER_REAL, limit)
+        return sp.simplify(expr)
+    except TimeoutError:
+        return expr
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def _to_sympy_affine(
     tokens: list[str],
     b0: float,
@@ -504,7 +565,7 @@ def _to_sympy_affine(
         return None
     final = sp.Float(b0) + sp.Float(b1) * expr
     try:
-        simplified = sp.simplify(final)
+        simplified = _bounded_simplify(final)
         eq_str = str(simplified)
     except Exception:
         simplified = final
@@ -553,7 +614,7 @@ def _to_sympy(tokens: list[str]) -> tuple[str, Any] | None:
     if expr is None:
         return None
     try:
-        simplified = sp.simplify(expr)
+        simplified = _bounded_simplify(expr)
         eq_str = str(simplified)
     except Exception:
         eq_str = str(expr)
