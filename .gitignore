@@ -11,10 +11,12 @@ venv/
 *.iml
 *.csv
 *.log
+*.docx
+*.docx.bak
 nsr_cache/
 .pytest_cache/
 .mypy_cache/
-benchmarks/results/
+benchmarks/
 **/src/nsr_engine.egg-info
 **/nsr_publication.md
 .venv-pysindy/
