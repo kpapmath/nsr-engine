@@ -39,6 +39,7 @@ def test_fit_returns_pareto_front():
         random_state=0,
         standardize=True,
         affine_reward=True,
+        boosting=False,  # the single-fit contract; the boosted path has its own tests
     )
     front = engine.fit(X, y)
     assert isinstance(front, ParetoFront)

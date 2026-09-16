@@ -379,11 +379,14 @@ the largest score drop per added unit of complexity.
 
 ## Accuracy Layers
 
-Everything above produces a front from a single `fit`. Three optional post-hoc
-layers extend that front. They consume only the SymPy expressions the engine
+Everything above describes one `fit` of the policy. Three post-hoc layers
+extend the front it produces. They consume only the SymPy expressions the engine
 emits, so they change neither the policy nor the reward, and each is
-accept-if-better. Full detail is in [accuracy_layers.md](accuracy_layers.md);
-this section covers where they sit in the method.
+accept-if-better. Layer 1 has been the default since 0.7.0 — `fit` runs the
+boosting loop over fresh per-round policies unless `boosting=False` — while
+layers 2 and 3 stay opt-in. Full detail is in
+[accuracy_layers.md](accuracy_layers.md); this section covers where they sit in
+the method.
 
 The affine reward described above has two structural limits, and the layers
 address them:
@@ -484,7 +487,8 @@ or, when `cache_prefix` is set:
 | Lower memory during training | Set `step_subsample_size` or use `fit_memmap`. |
 | Better final candidate diversity | Increase `prefilter_per_complexity`. |
 | Reproducible experiments | Set `random_state`, cache with `cache_dir`, and keep data ordering fixed. |
-| Target is a sum of additive terms | Enable residual boosting; raise `max_rounds` and lower `min_gain` to keep more terms. |
+| Target is a sum of additive terms | Residual boosting is already on; raise `boosting_max_rounds` and lower `boosting_min_gain` to keep more terms. |
+| A fixed compute budget, or a known single-term target | `boosting=False` — one fit instead of up to `boosting_max_rounds`. |
 | Formula needs non-quantized interior constants | Enable constant optimization. |
 | Boosted terms look redundant or over-weighted | Enable joint refit, and lower `coef_rel_tol` to prune less aggressively. |
 | Accuracy layers are slow on a very large table | Lower `fit_subsample`; it caps the rows both the constant fit and the joint refit see, and reported scores still use every row. |

@@ -232,6 +232,9 @@ def test_boosting_accepts_a_real_engine():
             unary_ops=("square", "abs", "log", "exp"),
             random_state=42 + round_idx,
             device="cpu",
+            # The round *is* the weak learner; a round that boosted again would
+            # nest one booster inside another.
+            boosting=False,
         )
 
     booster = ResidualBoostedNSR(factory, max_rounds=2)
@@ -239,6 +242,137 @@ def test_boosting_accepts_a_real_engine():
 
     assert isinstance(front, ParetoFront)
     assert len(booster.rounds_) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Layer 1 as the engine default (0.7.0)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_boosts_by_default():
+    engine = NSREngine()
+
+    assert engine.boosting is True
+    assert engine.boosting_max_rounds == 3
+    assert engine.boosting_min_gain == 0.02
+
+
+def _record_dispatch(monkeypatch, engine) -> list[str]:
+    calls: list[str] = []
+
+    def single(X, y):
+        calls.append("single")
+        return ParetoFront([])
+
+    def boosted(X, y):
+        calls.append("boosted")
+        return ParetoFront([])
+
+    monkeypatch.setattr(engine, "_fit_single", single)
+    monkeypatch.setattr(engine, "_fit_boosted", boosted)
+    return calls
+
+
+def test_engine_fit_dispatches_to_the_boosted_path_by_default(monkeypatch):
+    engine = NSREngine()
+    calls = _record_dispatch(monkeypatch, engine)
+
+    engine.fit(pd.DataFrame({"a": [1.0]}), pd.Series([1.0]))
+
+    assert calls == ["boosted"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"boosting": False}, {"boosting_max_rounds": 1}],
+    ids=["boosting-off", "one-round"],
+)
+def test_engine_fit_runs_a_single_fit_when_boosting_cannot_add_a_term(
+    monkeypatch, kwargs
+):
+    """One round would return that round's elbow alone — a smaller front."""
+    engine = NSREngine(**kwargs)
+    calls = _record_dispatch(monkeypatch, engine)
+
+    engine.fit(pd.DataFrame({"a": [1.0]}), pd.Series([1.0]))
+
+    assert calls == ["single"]
+
+
+def test_round_engine_is_fresh_and_does_not_boost():
+    engine = NSREngine(random_state=7, cache_prefix="run")
+
+    second = engine._round_engine(2)
+
+    assert second.boosting is False
+    assert second.random_state == 9
+    assert second.cache_prefix == "run_round2"
+    assert engine.cache_prefix == "run"  # the original is untouched
+    assert second.max_len == engine.max_len  # every other setting carries over
+
+
+def test_merge_fronts_keeps_the_simple_end_of_the_round_one_front():
+    """The booster emits one point per round; merging restores the rest."""
+    from nsr_engine.engine import _merge_fronts
+
+    round_one = ParetoFront(
+        [
+            ParetoPoint(equation="a", sympy_expr=None, complexity=1, mse=9.0),
+            ParetoPoint(equation="a + b", sympy_expr=None, complexity=3, mse=4.0),
+        ]
+    )
+    boosted = ParetoFront(
+        [
+            ParetoPoint(equation="a + b", sympy_expr=None, complexity=3, mse=4.0),
+            ParetoPoint(equation="a + b + c", sympy_expr=None, complexity=5, mse=1.0),
+        ]
+    )
+
+    merged = _merge_fronts(round_one, boosted)
+
+    assert [(p.equation, p.complexity) for p in sorted(
+        merged.points, key=lambda p: p.complexity
+    )] == [("a", 1), ("a + b", 3), ("a + b + c", 5)]
+
+
+def test_merge_fronts_drops_dominated_points():
+    from nsr_engine.engine import _merge_fronts
+
+    merged = _merge_fronts(
+        ParetoFront(
+            [ParetoPoint(equation="worse", sympy_expr=None, complexity=4, mse=9.0)]
+        ),
+        ParetoFront(
+            [ParetoPoint(equation="better", sympy_expr=None, complexity=2, mse=1.0)]
+        ),
+    )
+
+    assert [p.equation for p in merged.points] == ["better"]
+
+
+@pytest.mark.slow
+def test_engine_default_fit_boosts_and_covers_the_single_fit_front():
+    X, y = _make_data(n=400)
+    kwargs = dict(
+        n_lambda=2,
+        n_iters=5,
+        batch_size=16,
+        max_len=7,
+        unary_ops=("square", "abs", "log", "exp"),
+        random_state=42,
+        device="cpu",
+    )
+
+    boosted = NSREngine(boosting_max_rounds=2, **kwargs).fit(X, y)
+    single = NSREngine(boosting=False, **kwargs).fit(X, y)
+
+    assert isinstance(boosted, ParetoFront)
+    # Round 1 runs the same search as the single fit, so its points are in
+    # there too: boosting adds reach, it never trades the simple end away.
+    assert len(boosted) >= len(single)
+    assert min(p.complexity for p in boosted.points) == min(
+        p.complexity for p in single.points
+    )
 
 
 # ---------------------------------------------------------------------------

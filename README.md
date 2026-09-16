@@ -49,13 +49,20 @@ print(front.to_frame())
 print("elbow formula:", front.elbow().equation)
 ```
 
+`fit` **boosts residuals by default** (since 0.7.0): round 1 is an ordinary
+fit, and each later round searches the residual the previous rounds leave, so
+the front can hold sums of terms — see [accuracy layers](#accuracy-layers). It
+costs up to `boosting_max_rounds` (3) fits instead of one; `NSREngine(boosting=False)`
+restores the single fit.
+
+
 ## Accuracy layers
 
 Three post-hoc passes sit on top of the engine's output. They operate on the
 sympy expressions the engine emits — no change to the policy or the reward — and
 each is **accept-if-better**, so enabling one can never make the training fit
-worse. From the Python API all three are opt-in wrappers; from the CLI layer 1
-runs by default.
+worse. Layer 1 runs by default, in both the Python API and the CLI; layers 2
+and 3 are opt-in.
 
 | Layer | What it fixes | API |
 |---|---|---|
@@ -63,12 +70,31 @@ runs by default.
 | 2 — Constant optimization | Constants are quantized to the token set plus the affine `b0, b1`, so interior weights (the `1.5` in `1.5*log(x4)`) are unreachable. Refits every float by least squares. | `optimize_constants`, `optimize_front` |
 | 3 — Joint refit + prune | Boosting scales each term once and never revisits it. Re-weights the discovered terms jointly with LASSO and drops the redundant ones. | `joint_refit_prune` |
 
+Layer 1 is the engine default — `NSREngine(...).fit(X, y)` already boosts, and
+`engine.boost_terms_` holds the discovered terms afterwards:
+
+```python
+from nsr_engine import NSREngine, joint_refit_prune
+
+engine = NSREngine(n_lambda=4, n_iters=150, max_len=17, random_state=42,
+                   unary_ops=("square", "abs", "log", "exp", "sqrt"),
+                   boosting_max_rounds=3, boosting_min_gain=0.02)   # layer 1
+front = engine.fit(X, y)
+
+refined = joint_refit_prune(engine.boost_terms_, X, y)              # layer 3
+```
+
+`ResidualBoostedNSR` is still there for full control of the rounds — a
+per-round refiner (layer 2 inside layer 1), a different engine per round, or
+any engine that yields a `ParetoFront`. Its rounds must not boost again:
+
 ```python
 from nsr_engine import NSREngine, ResidualBoostedNSR, joint_refit_prune, optimize_constants
 
 def engine_factory(round_idx: int) -> NSREngine:
     return NSREngine(n_lambda=4, n_iters=150, max_len=17, random_state=42 + round_idx,
-                     unary_ops=("square", "abs", "log", "exp", "sqrt"))
+                     unary_ops=("square", "abs", "log", "exp", "sqrt"),
+                     boosting=False)   # the round *is* the weak learner
 
 booster = ResidualBoostedNSR(engine_factory, max_rounds=3, min_gain=0.02,
                              term_refiner=optimize_constants)   # layers 1 + 2
@@ -79,8 +105,9 @@ refined = joint_refit_prune(booster.terms_, X, y)               # layer 3
 
 On a two-additive-term target (`exp(x2) - 1.5*log(x4)`, medium noise) this moves
 elbow test R² from **0.66** (plain NSR) to **0.835** (boosting) to **0.879**
-(joint refit). Boosting is accept-if-better — round 1 is plain NSR — so the CLI
-runs it by default; layers 2 and 3 are opt-in:
+(joint refit). Boosting is accept-if-better — round 1 is plain NSR, and its
+front is merged back into the result — so it runs by default; layers 2 and 3
+are opt-in:
 
 ```bash
 python main.py --constant-opt --joint-refit   # layer 1 is already on

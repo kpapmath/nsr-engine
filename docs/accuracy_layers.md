@@ -7,9 +7,9 @@ objects.
 
 Every layer is **accept-if-better**: it can never return a worse training fit
 than it was given, so enabling one is always safe. That is why layer 1 is the
-CLI default (`main.py` boosts unless you pass `--no-boosting`) — its only cost is
-wall clock. The Python API is unchanged: `NSREngine.fit` is a single fit, and
-boosting is opting into the `ResidualBoostedNSR` wrapper.
+default in both surfaces as of 0.7.0 — `NSREngine.fit` boosts unless you pass
+`boosting=False`, and `main.py` boosts unless you pass `--no-boosting`. Its only
+cost is wall clock. Layers 2 and 3 stay opt-in.
 
 ## Why they exist
 
@@ -78,6 +78,45 @@ fit: a joint fit over a fixed library (SINDy-style) needs a pre-enumerated basis
 whereas boosting lets NSR **discover** each basis function in turn. The cost is
 greediness — a term chosen early is never revised, which Layer 3 corrects.
 
+### The engine default
+
+Since 0.7.0 `NSREngine.fit` runs this loop itself, so the layer needs no wiring:
+
+```python
+from nsr_engine import NSREngine
+
+engine = NSREngine(
+    n_lambda=4, n_iters=150, batch_size=64, max_len=17,
+    unary_ops=("square", "abs", "log", "exp", "sqrt"),
+    random_state=42, device="cpu",
+    boosting_max_rounds=3, boosting_min_gain=0.02,   # the defaults, spelled out
+)
+front = engine.fit(X_train, y_train)
+engine.boost_terms_    # (sympy_expr, complexity) per kept term — Layer 3's input
+engine.boost_rounds_   # per-round diagnostics
+```
+
+Each round is a copy of the engine with `boosting=False`, `random_state +
+round_idx`, and a `_round<k>` cache prefix. Two differences from driving the
+booster by hand:
+
+- **The front keeps its simple end.** `ResidualBoostedNSR` returns one point per
+  round; the engine merges round 1's *full* front back in (round 1 searched `y`
+  itself, so that front is exactly the un-boosted result) and re-filters for
+  dominance. The front therefore never covers less than `boosting=False` would.
+- **Rounds are scored in the engine's own metric** when that is `"mse"` or
+  `"rmse"`. Under any other `score_metric` the rounds are scored in MSE and the
+  round-1 front is *not* merged, since a front mixing two metrics is meaningless.
+
+`boosting=False` restores the pre-0.7 single fit; `boosting_max_rounds=1` routes
+there too, since one round would return that round's elbow alone.
+
+### Driving the rounds by hand
+
+`ResidualBoostedNSR` stays the way to control what a round *is* — a per-round
+refiner (Layer 2 inside Layer 1), a different engine per round, or a non-NSR
+engine. Each round must be built with `boosting=False`:
+
 ```python
 from nsr_engine import NSREngine, ResidualBoostedNSR
 
@@ -87,6 +126,7 @@ def engine_factory(round_idx: int) -> NSREngine:
         unary_ops=("square", "abs", "log", "exp", "sqrt"),
         random_state=42 + round_idx,   # a fresh engine, and a seed that moves
         device="cpu",
+        boosting=False,                # the round *is* the weak learner
     )
 
 booster = ResidualBoostedNSR(engine_factory, max_rounds=3, min_gain=0.02)
@@ -95,7 +135,7 @@ front = booster.fit(X_train, y_train)
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `engine_factory` | — | `factory(round_idx) -> engine` with `engine.fit(X, y) -> ParetoFront`, called once per round with the **1-based** round index. Must return a **fresh** engine; vary its seed with `round_idx`. |
+| `engine_factory` | — | `factory(round_idx) -> engine` with `engine.fit(X, y) -> ParetoFront`, called once per round with the **1-based** round index. Must return a **fresh** engine; vary its seed with `round_idx`. An `NSREngine` needs `boosting=False`, or the round boosts inside the booster. |
 | `max_rounds` | `3` | Hard cap on additive terms. |
 | `min_gain` | `0.02` | After round 1, keep a round only if it cuts training MSE by at least this relative amount. Guards against appending noise-fitting terms. |
 | `term_refiner` | `None` | Optional `f(expr, X, residual) -> expr` hook applied to each picked term **before** it is subtracted, so later rounds fit a cleaner residual. Pass `optimize_constants` here to run Layer 2 inside Layer 1. |

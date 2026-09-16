@@ -52,6 +52,7 @@ Performance design
 
 from __future__ import annotations
 
+import copy
 import heapq
 import json
 import math
@@ -889,6 +890,44 @@ class _OOCExpr:
 # NSR Engine
 # ---------------------------------------------------------------------------
 
+def _merge_fronts(*fronts: ParetoFront) -> ParetoFront:
+    """Union fronts into one non-dominated front, de-duplicated by equation.
+
+    Identical points do not dominate each other (dominance needs a strict
+    inequality in one dimension), so the same equation reached by two fronts
+    would survive twice; keyed by equation, the better-scoring copy wins.
+    """
+    best: dict[str, ParetoPoint] = {}
+    for front in fronts:
+        for pt in front.points:
+            incumbent = best.get(pt.equation)
+            if incumbent is None or (pt.score, pt.complexity) < (
+                incumbent.score,
+                incumbent.complexity,
+            ):
+                best[pt.equation] = pt
+    return ParetoFront(list(best.values())).dominance_filter()
+
+
+class _BoostingRound:
+    """One boosting round: an engine that also records the front it produced.
+
+    ``ResidualBoostedNSR`` returns one point per kept round and discards the
+    rest of each round's front.  Round 1's full front is the un-boosted result,
+    so it is worth keeping; this records it on the way past without widening
+    the booster's own contract.
+    """
+
+    def __init__(self, engine: "NSREngine", sink: list[ParetoFront]) -> None:
+        self._engine = engine
+        self._sink = sink
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> ParetoFront:
+        front = self._engine.fit(X, y)
+        self._sink.append(front)
+        return front
+
+
 class NSREngine:
     """Neural symbolic regression engine with PyTorch RNN + REINFORCE.
 
@@ -1004,6 +1043,33 @@ class NSREngine:
         Max global gradient-norm for policy updates (``clip_grad_norm_``).  Previously
         hard-coded to ``1.0``; exposed so the clip that bounds a single noisy REINFORCE
         step can be tightened for extra stability.  Defaults to ``1.0`` (unchanged).
+    boosting:
+        Accuracy layer 1, **on by default** since 0.7.0 (before it was opt-in
+        through the :class:`~nsr_engine.boosting.ResidualBoostedNSR` wrapper).
+        The affine reward fits ``b0 + b1*expr`` — one expression, not a sum —
+        so additive terms of comparable magnitude collapse into a linear
+        surrogate.  With boosting, each round fits a fresh policy on the
+        previous rounds' residual and the rounds sum to
+        ``intercept + sum_k b_k*expr_k``.  Round 1 is an ordinary fit whose
+        full front is merged back into the result, so the front returned is
+        never smaller than ``boosting=False`` would give; the cost is up to
+        ``boosting_max_rounds`` fits instead of one.  Set ``False`` for a single
+        fit — the pre-0.7 behaviour — when the budget is fixed or the target is
+        known to be a single term.  ``fit_memmap`` is unaffected: the
+        out-of-core path always runs a single fit.
+    boosting_max_rounds:
+        Hard cap on the number of additive terms.  ``1`` is equivalent to
+        ``boosting=False``.
+    boosting_min_gain:
+        After round 1, a round is kept only if it cuts the training score by at
+        least this relative amount, which stops terms being appended to noise.
+        Measured in ``score_metric`` when that is ``"mse"`` or ``"rmse"``, and
+        in MSE otherwise — and the two are not the same threshold
+        (``gain_rmse = 1 - sqrt(1 - gain_mse)``).
+    boosting_term_selection:
+        ``"elbow"`` takes each round's elbow point, keeping terms compact;
+        ``"min_mse"`` takes the round's most accurate point, recovering more per
+        round when parsimony is not the priority.
     """
 
     def __init__(
@@ -1049,6 +1115,10 @@ class NSREngine:
         lambda_relative: bool = True,
         refine_constants: bool = True,
         refine_max_nfev: int = 200,
+        boosting: bool = True,
+        boosting_max_rounds: int = 3,
+        boosting_min_gain: float = 0.02,
+        boosting_term_selection: str = "elbow",
     ) -> None:
         if not _TORCH_AVAILABLE:
             raise ImportError(
@@ -1072,6 +1142,17 @@ class NSREngine:
             raise ValueError(f"restarts_per_lambda must be >= 1 (got {restarts_per_lambda})")
         if grad_clip_norm <= 0.0:
             raise ValueError(f"grad_clip_norm must be > 0 (got {grad_clip_norm})")
+        if boosting_max_rounds < 1:
+            raise ValueError(
+                f"boosting_max_rounds must be >= 1 (got {boosting_max_rounds})"
+            )
+        # Checked here rather than at fit time: the booster would otherwise only
+        # reject it after round 1 has already been trained.
+        from nsr_engine.boosting import _TERM_SELECTIONS
+
+        if boosting_term_selection not in _TERM_SELECTIONS:
+            supported = ", ".join(repr(sel) for sel in _TERM_SELECTIONS)
+            raise ValueError(f"boosting_term_selection must be one of: {supported}")
         score_metric = score_metric.lower()
         if score_metric not in _SCORE_METRICS:
             supported = ", ".join(repr(m) for m in _SCORE_METRICS)
@@ -1134,6 +1215,12 @@ class NSREngine:
         self.refine_constants = refine_constants
         self.refine_max_nfev = refine_max_nfev
         self.grad_clip_norm = grad_clip_norm
+        self.boosting = boosting
+        self.boosting_max_rounds = boosting_max_rounds
+        self.boosting_min_gain = boosting_min_gain
+        self.boosting_term_selection = boosting_term_selection
+        self.boost_rounds_: list[dict[str, Any]] = []
+        self.boost_terms_: list[tuple[Any, int]] = []
         self._feat_mean: dict[str, float] | None = None
         self._feat_std: dict[str, float] | None = None
 
@@ -1246,6 +1333,98 @@ class NSREngine:
     # ------------------------------------------------------------------
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> ParetoFront:
+        """Fit and return the Pareto front.
+
+        Residual boosting is **on by default**.  Round 1 is an ordinary fit;
+        each later round trains a fresh policy on the residual its predecessors
+        leave, so the result can express a *sum* of terms — something the
+        affine reward (``b0 + b1*expr``, one expression) cannot reach in one
+        shot.  The returned front is round 1's own front unioned with the
+        boosted sums, so it never covers less than ``boosting=False`` would;
+        boosting only ever adds points, at up to ``boosting_max_rounds`` times
+        the cost.
+
+        Pass ``boosting=False`` for a single fit.  ``boosting_max_rounds=1`` is
+        also routed there: one round would return the round's elbow alone,
+        which is a strictly smaller front than the same search un-boosted.
+        """
+        if not self.boosting or self.boosting_max_rounds < 2:
+            return self._fit_single(X, y)
+        return self._fit_boosted(X, y)
+
+    def _fit_boosted(self, X: pd.DataFrame, y: pd.Series) -> ParetoFront:
+        """Greedy additive boosting over fresh per-round engines (layer 1)."""
+        from nsr_engine.boosting import ResidualBoostedNSR
+
+        # The booster measures rounds in MSE or RMSE only.  Where the engine's
+        # own metric is one of those, using it keeps a single metric across the
+        # whole front; under any other metric the rounds are scored in MSE, and
+        # a front mixing the two would be meaningless — so the round-1 front is
+        # not merged in that case.
+        metrics_agree = self.score_metric in ("mse", "rmse")
+        round_fronts: list[ParetoFront] = []
+
+        booster = ResidualBoostedNSR(
+            lambda round_idx: _BoostingRound(self._round_engine(round_idx), round_fronts),
+            max_rounds=self.boosting_max_rounds,
+            min_gain=self.boosting_min_gain,
+            term_selection=self.boosting_term_selection,
+            residual_metric=self.score_metric if metrics_agree else "mse",
+        )
+        boosted = booster.fit(X, y)
+        # Kept for callers that want the terms — `joint_refit_prune` (layer 3)
+        # consumes `boost_terms_` exactly as it consumes `ResidualBoostedNSR.terms_`.
+        self.boost_rounds_ = booster.rounds_
+        self.boost_terms_ = booster.terms_
+        for record in booster.rounds_:
+            print(
+                f"[nsr] boost round {record['round']}: added={record['added']} "
+                f"gain={record['gain']:.4f} cum_mse={record['cum_mse']:.6f} "
+                f"({record['reason']})",
+                flush=True,
+            )
+
+        if not round_fronts:
+            return boosted
+        if not metrics_agree:
+            print(
+                f"[nsr] note: boosted points are scored in MSE, not "
+                f"{self.score_metric!r} — returning the boosted front alone",
+                flush=True,
+            )
+            return boosted
+
+        # Round 1 searched `y` itself, so its front is exactly what
+        # `boosting=False` would have returned.  Merging it back keeps the
+        # simple, low-complexity end that the booster's one-point-per-round
+        # front drops.
+        merged = _merge_fronts(round_fronts[0], boosted)
+        print(f"[nsr] boosted front: {len(merged)} non-dominated points")
+        return merged
+
+    def _round_engine(self, round_idx: int) -> "NSREngine":
+        """A fresh engine for boosting round ``round_idx``.
+
+        ``copy.copy`` rather than a re-built constructor call, so a parameter
+        added later is carried over without another place to update.  Boosting
+        is switched off — the round *is* the weak learner, and a round that
+        boosted again would recurse — the seed moves so rounds do not repeat
+        the same search, and the cache takes a per-round prefix so a round
+        cannot read a pool discovered against a different residual.
+        """
+        engine = copy.copy(self)
+        engine.boosting = False
+        engine.random_state = self.random_state + round_idx
+        if self.cache_prefix is not None:
+            engine.cache_prefix = f"{self.cache_prefix}_round{round_idx}"
+        engine.boost_rounds_ = []
+        engine.boost_terms_ = []
+        # Standardization stats belong to the round that computes them.
+        engine._feat_mean = None
+        engine._feat_std = None
+        return engine
+
+    def _fit_single(self, X: pd.DataFrame, y: pd.Series) -> ParetoFront:
         """Train the NSR policy for each lambda and return the pooled Pareto front."""
         self._warn_negative_columns(X)
         features = list(X.columns)

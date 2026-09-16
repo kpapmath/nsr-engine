@@ -344,7 +344,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def _build_engine(args: argparse.Namespace, *, cache_prefix: str | None = None) -> NSREngine:
+    """One un-boosted engine.
+
+    ``NSREngine`` boosts by default, but the CLI drives layer 1 itself through
+    :class:`ResidualBoostedNSR` — it needs the per-round diagnostics and the
+    terms that ``--joint-refit`` consumes — so the engine it builds is always a
+    single fit and ``--boosting`` decides whether it gets wrapped.
+    """
     return NSREngine(
+        boosting=False,
         lambda_grid=args.lambda_grid,
         n_lambda=args.n_lambda,
         lambda_min=args.lambda_min,

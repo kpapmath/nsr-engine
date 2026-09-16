@@ -32,6 +32,10 @@ def small_engine(
         "hidden_dim": 32,
         "embed_dim": 12,
         "prefilter_per_complexity": 4,
+        # A single fit, against the engine default: these examples exist to run
+        # in seconds, and `accuracy_layers.py` drives boosting explicitly so it
+        # can show the layers one at a time.  Pass `boosting=True` to override.
+        "boosting": False,
     }
     return NSREngine(
         n_lambda=n_lambda,

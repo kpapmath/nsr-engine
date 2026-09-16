@@ -280,6 +280,10 @@ These are the constructor arguments accepted by `NSREngine(...)`.
 | `prefilter_per_complexity` | `16` | Number of best candidates to keep per complexity, ranked by exact full-set score, before SymPy conversion. |
 | `prefilter_metric` | `"exact"` | `"exact"` ranks the prefilter on full-dataset scores, so truncation provably cannot drop a front member. `"approx"` ranks on the noisy subsampled training score (pre-0.4 behaviour), retained for reproducing old runs. |
 | `exact_prefilter_multiple` | `8` | Caps the exactly-scored pool at this multiple of `prefilter_per_complexity` per complexity. `None` scores the entire pool, making the guarantee unconditional at higher cost. |
+| `boosting` | `True` | Accuracy layer 1, on by default since 0.7.0. `fit` runs up to `boosting_max_rounds` rounds, each a fresh policy on the previous rounds' residual, so the front can hold sums of terms. Round 1's own front is merged into the result, so the front is never smaller than a single fit's. `False` restores the pre-0.7 single fit. Does not affect `fit_memmap`. |
+| `boosting_max_rounds` | `3` | Hard cap on the number of additive terms, and the multiple of a single fit's cost. `1` is equivalent to `boosting=False`. |
+| `boosting_min_gain` | `0.02` | After round 1, a round is kept only if it cuts the training score by at least this relative amount. |
+| `boosting_term_selection` | `"elbow"` | `"elbow"` or `"min_mse"`. Which point of each round's front becomes that round's term. |
 
 ### Score Metric Values
 
@@ -391,9 +395,24 @@ Each point is a `ParetoPoint` with:
 
 ## Accuracy Layers
 
-Three optional post-hoc passes over a front. They require the `refine` extra and
-are documented in full, with measured results, in
-[accuracy_layers.md](accuracy_layers.md).
+Three post-hoc passes over a front, documented in full, with measured results,
+in [accuracy_layers.md](accuracy_layers.md). They require the `refine` extra.
+Layer 1 is on by default (see `boosting` above); layers 2 and 3 are opt-in.
+
+```python
+from nsr_engine import NSREngine, ParetoFront, ParetoPoint, joint_refit_prune
+
+engine = NSREngine(n_lambda=4, n_iters=150, max_len=17,
+                   unary_ops=("square", "abs", "log", "exp", "sqrt"),
+                   random_state=42)
+front = engine.fit(X, y)              # layer 1, by default
+
+refined = joint_refit_prune(engine.boost_terms_, X, y)   # layer 3
+```
+
+`ResidualBoostedNSR` drives the rounds by hand where the default is not enough
+— a per-round refiner (layer 2 inside layer 1), or a different engine per round.
+Each round must be built with `boosting=False`, or the round boosts again:
 
 ```python
 from nsr_engine import (
@@ -404,7 +423,7 @@ from nsr_engine import (
 def engine_factory(round_idx: int) -> NSREngine:
     return NSREngine(n_lambda=4, n_iters=150, max_len=17,
                      unary_ops=("square", "abs", "log", "exp", "sqrt"),
-                     random_state=42 + round_idx)
+                     random_state=42 + round_idx, boosting=False)
 
 booster = ResidualBoostedNSR(engine_factory, max_rounds=3, min_gain=0.02,
                              term_refiner=optimize_constants)
@@ -425,7 +444,7 @@ Conforms to the same `fit(X, y) -> ParetoFront` contract as `NSREngine`.
 
 | Argument | Default | Explanation |
 | --- | --- | --- |
-| `engine_factory` | required | `factory(round_idx) -> engine` with `engine.fit(X, y) -> ParetoFront`, called once per round with the 1-based round index. Must return a fresh engine; vary its seed with `round_idx`. |
+| `engine_factory` | required | `factory(round_idx) -> engine` with `engine.fit(X, y) -> ParetoFront`, called once per round with the 1-based round index. Must return a fresh engine; vary its seed with `round_idx`. An `NSREngine` here needs `boosting=False` — the round is the weak learner, and would otherwise boost inside the booster. |
 | `max_rounds` | `3` | Hard cap on the number of additive terms. |
 | `min_gain` | `0.02` | After round 1, a round is kept only if it cuts training MSE by at least this relative amount. |
 | `term_refiner` | `None` | Optional `f(expr, X, residual) -> expr` hook applied to each picked term before it is subtracted. Pass `optimize_constants` to run layer 2 inside layer 1. |
