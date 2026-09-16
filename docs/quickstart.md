@@ -181,19 +181,20 @@ The CLI exposes data, split, engine, and accuracy-layer options.
 | `--prefilter-per-complexity` | `16` | Candidates kept per complexity, ranked by exact score, before SymPy conversion. |
 | `--prefilter-metric` | `exact` | `exact` truncates on full-dataset scores (front-preserving); `approx` is the pre-0.4 behaviour. |
 | `--exact-prefilter-multiple` | `8` | Caps the exactly-scored pool at this multiple of `--prefilter-per-complexity`; `none` scores everything. |
-| `--boosting` / `--no-boosting` | `False` | Accuracy layer 1. Fit additive terms by re-running the engine on each round's residual. |
+| `--boosting` / `--no-boosting` | `True` | Accuracy layer 1, on by default. Fit additive terms by re-running the engine on each round's residual. `--no-boosting` runs a single fit. |
 | `--boosting-max-rounds` | `3` | Hard cap on the number of additive terms. |
 | `--boosting-min-gain` | `0.02` | Minimum relative training-MSE improvement for a round to be kept. |
 | `--term-selection` | `"elbow"` | `elbow` or `min_mse`. Which point of each round's front becomes that round's term. |
 | `--constant-opt` / `--no-constant-opt` | `False` | Accuracy layer 2. Refit float constants by least squares. |
 | `--max-free-consts` | `12` | Skip constant optimization for expressions with more free constants than this. |
 | `--max-nfev` | `200` | Maximum residual evaluations per least-squares solve. |
-| `--joint-refit` / `--no-joint-refit` | `False` | Accuracy layer 3. Jointly re-weight and prune the boosted terms. Requires `--boosting`. |
+| `--joint-refit` / `--no-joint-refit` | `False` | Accuracy layer 3. Jointly re-weight and prune the boosted terms. Incompatible with `--no-boosting`. |
 | `--joint-refit-estimator` | `"lasso_cv"` | `lasso_cv` or `ols`. Estimator for the joint refit. |
 | `--coef-rel-tol` | `1e-3` | Relative weight threshold below which a term is pruned. |
 | `--fit-subsample` | `8000` | Shared by layers 2 and 3: maximum rows the constant fit and the joint refit see. `0` uses every row. |
 
-The accuracy layers are off by default and need the `refine` extra. See the
+Layer 1 (residual boosting) is on by default; layers 2 and 3 are opt-in. All
+three need the `refine` extra. See the
 [accuracy layers guide](accuracy_layers.md) and the
 [CLI reference](cli_reference.md#accuracy-layer-arguments).
 

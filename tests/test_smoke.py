@@ -215,6 +215,32 @@ def test_cli_validation_mode_defaults_to_none(monkeypatch):
     assert args.validation_mode == "none"
 
 
+def test_cli_boosts_residuals_by_default(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["nsr-engine"])
+
+    args = parse_args()
+
+    assert args.boosting is True
+
+
+def test_cli_no_boosting_opts_out_of_boosting(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["nsr-engine", "--no-boosting"])
+
+    args = parse_args()
+
+    assert args.boosting is False
+
+
+def test_cli_joint_refit_needs_the_default_boosting(monkeypatch):
+    """Layer 3 consumes the boosted terms, so opting out of layer 1 is an error."""
+    monkeypatch.setattr("sys.argv", ["nsr-engine", "--joint-refit"])
+    assert parse_args().joint_refit is True
+
+    monkeypatch.setattr("sys.argv", ["nsr-engine", "--joint-refit", "--no-boosting"])
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def test_cli_accepts_kfold_alias(monkeypatch):
     monkeypatch.setattr("sys.argv", ["nsr-engine", "--validation-mode", "kfold"])
 

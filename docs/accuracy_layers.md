@@ -6,7 +6,10 @@ emits, so they work with any engine that yields `ParetoFront` / `ParetoPoint`
 objects.
 
 Every layer is **accept-if-better**: it can never return a worse training fit
-than it was given, so enabling one is always safe.
+than it was given, so enabling one is always safe. That is why layer 1 is the
+CLI default (`main.py` boosts unless you pass `--no-boosting`) — its only cost is
+wall clock. The Python API is unchanged: `NSREngine.fit` is a single fit, and
+boosting is opting into the `ResidualBoostedNSR` wrapper.
 
 ## Why they exist
 
@@ -235,20 +238,23 @@ R² of each stage.
 
 ## From the CLI
 
-The layers are off by default. See the
+Layer 1 is on by default; layers 2 and 3 are opt-in. See the
 [CLI reference](cli_reference.md#accuracy-layer-arguments) for every flag.
 
 ```bash
-# Layer 1 only
-python main.py --boosting --boosting-max-rounds 3 --boosting-min-gain 0.02
+# Layer 1, tuned (boosting is already the default)
+python main.py --boosting-max-rounds 3 --boosting-min-gain 0.02
 
 # All three
-python main.py --boosting --constant-opt --joint-refit --validation-mode sequential
+python main.py --constant-opt --joint-refit --validation-mode sequential
+
+# Opt out: a single engine fit, for a fixed budget or a known single-term target
+python main.py --no-boosting
 ```
 
-`--joint-refit` requires `--boosting`, since it consumes the boosted terms.
-`--constant-opt` works on its own: without `--boosting` it refines every point of
-the ordinary front.
+`--joint-refit` is incompatible with `--no-boosting`, since it consumes the
+boosted terms. `--constant-opt` works either way: under `--no-boosting` it
+refines every point of the ordinary front.
 
 ## Ordering, determinism, and cost
 

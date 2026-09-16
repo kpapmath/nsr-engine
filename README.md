@@ -51,10 +51,11 @@ print("elbow formula:", front.elbow().equation)
 
 ## Accuracy layers
 
-Three optional post-hoc passes sit on top of the engine's output. They operate on
-the sympy expressions the engine emits — no change to the policy or the reward —
-and each is **accept-if-better**, so enabling one can never make the training fit
-worse.
+Three post-hoc passes sit on top of the engine's output. They operate on the
+sympy expressions the engine emits — no change to the policy or the reward — and
+each is **accept-if-better**, so enabling one can never make the training fit
+worse. From the Python API all three are opt-in wrappers; from the CLI layer 1
+runs by default.
 
 | Layer | What it fixes | API |
 |---|---|---|
@@ -78,10 +79,12 @@ refined = joint_refit_prune(booster.terms_, X, y)               # layer 3
 
 On a two-additive-term target (`exp(x2) - 1.5*log(x4)`, medium noise) this moves
 elbow test R² from **0.66** (plain NSR) to **0.835** (boosting) to **0.879**
-(joint refit). From the CLI:
+(joint refit). Boosting is accept-if-better — round 1 is plain NSR — so the CLI
+runs it by default; layers 2 and 3 are opt-in:
 
 ```bash
-python main.py --boosting --constant-opt --joint-refit
+python main.py --constant-opt --joint-refit   # layer 1 is already on
+python main.py --no-boosting                  # single fit, ~1/3 the cost
 ```
 
 Full detail, measured results across the benchmark grid, and known limitations

@@ -237,12 +237,17 @@ def parse_args() -> argparse.Namespace:
     _add_bool_arg(
         layers,
         "boosting",
-        default=False,
+        default=True,
         help_text=(
             "Fit additive terms by running the engine on the residual of the "
-            "previous rounds (accuracy layer 1)."
+            "previous rounds (accuracy layer 1). On by default; round 1 is "
+            "plain NSR, so the boosted front is never worse than the "
+            "unboosted one."
         ),
-        disable_help_text="Run a single engine fit (no residual boosting).",
+        disable_help_text=(
+            "Run a single engine fit (no residual boosting), at roughly "
+            "1/--boosting-max-rounds of the cost."
+        ),
     )
     layers.add_argument("--boosting-max-rounds", type=int, default=3)
     layers.add_argument("--boosting-min-gain", type=float, default=0.02)
@@ -305,7 +310,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--target-col is required when --input-csv is provided")
 
     if args.joint_refit and not args.boosting:
-        parser.error("--joint-refit requires --boosting (it consumes the boosted terms)")
+        parser.error(
+            "--joint-refit needs boosting (it consumes the boosted terms); "
+            "drop --no-boosting"
+        )
 
     if args.boosting and args.boosting_max_rounds < 1:
         parser.error("--boosting-max-rounds must be at least 1")

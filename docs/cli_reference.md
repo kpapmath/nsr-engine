@@ -108,44 +108,48 @@ python main.py --unary-ops square,abs,log,sqrt,sin,cos,tanh --metric r2
 
 ## Accuracy layer arguments
 
-Three optional post-hoc layers, all off by default. They need the `refine`
-extra (`pip install "nsr-engine[refine]"`). See the
+Three post-hoc layers. Layer 1 (residual boosting) is **on by default**;
+layers 2 and 3 are opt-in. They need the `refine` extra
+(`pip install "nsr-engine[refine]"`). See the
 [accuracy layers guide](accuracy_layers.md) for what each one does and when it
 helps.
 
 | Argument | Default | Available options | Explanation |
 | --- | --- | --- | --- |
-| `--boosting` / `--no-boosting` | `False` | Flag | Layer 1. Fit additive terms by re-running the engine on each round's residual, instead of a single fit. |
+| `--boosting` / `--no-boosting` | `True` | Flag | Layer 1. Fit additive terms by re-running the engine on each round's residual, instead of a single fit. On by default: round 1 is plain NSR, so the boosted front is never worse than the unboosted one. Pass `--no-boosting` for a single fit at roughly `1/--boosting-max-rounds` of the cost. |
 | `--boosting-max-rounds` | `3` | Any integer `>= 1` | Hard cap on the number of additive terms. |
 | `--boosting-min-gain` | `0.02` | Any float | After round 1, keep a round only if it cuts training MSE by at least this relative amount. |
 | `--term-selection` | `"elbow"` | `"elbow"`, `"min_mse"` | Which point of each round's front becomes that round's term. `"elbow"` keeps terms compact; `"min_mse"` recovers more per round. |
-| `--constant-opt` / `--no-constant-opt` | `False` | Flag | Layer 2. Refit float constants by least squares. With `--boosting` it refines each term before subtraction; without it, every point of the front. |
+| `--constant-opt` / `--no-constant-opt` | `False` | Flag | Layer 2. Refit float constants by least squares. With boosting it refines each term before subtraction; under `--no-boosting`, every point of the front. |
 | `--max-free-consts` | `12` | Any positive integer | Skip constant optimization for expressions with more free constants than this. More free parameters is slow and overfits. |
 | `--max-nfev` | `200` | Any positive integer | Maximum residual evaluations per least-squares solve. |
-| `--joint-refit` / `--no-joint-refit` | `False` | Flag | Layer 3. Re-weight the boosted terms jointly and prune redundant ones. Requires `--boosting`. |
+| `--joint-refit` / `--no-joint-refit` | `False` | Flag | Layer 3. Re-weight the boosted terms jointly and prune redundant ones. Needs boosting, so it is incompatible with `--no-boosting`. |
 | `--joint-refit-estimator` | `"lasso_cv"` | `"lasso_cv"`, `"ols"` | Estimator for the joint refit. `"lasso_cv"` gives sparse weights so redundant terms can be pruned; `"ols"` skips the sparsity penalty. |
 | `--coef-rel-tol` | `1e-3` | Any positive float | Prune a term when `|w| <= coef_rel_tol * max|w|`. |
 | `--fit-subsample` | `8000` | Non-negative integer | Shared by layers 2 and 3: maximum rows the constant fit and the joint refit see, drawn from a seeded RNG. `0` uses every row. Reported scores always use every row, so this trades fit cost against weight precision, never against score accuracy. |
 
-Boosting runs up to `--boosting-max-rounds` full engine fits, so a boosted run
-costs roughly that multiple of an ordinary one. Each round caches under its own
-prefix (`<cache-prefix>_round<k>`), so `--cache-dir` works across re-runs.
+Boosting runs up to `--boosting-max-rounds` full engine fits, so the default
+run costs roughly that multiple of a single fit. Early stopping cuts it short
+when a round does not earn its place, and each round caches under its own prefix
+(`<cache-prefix>_round<k>`), so `--cache-dir` works across re-runs. `--no-boosting`
+buys back the cost when the target is known to be a single term, or when a run
+has to stay inside a fixed budget.
 
 Examples:
 
 ```bash
-# Layer 1 only: the target is a sum of additive terms
-python main.py --boosting --boosting-max-rounds 3 --boosting-min-gain 0.02
+# Default: boosting, tuned
+python main.py --boosting-max-rounds 3 --boosting-min-gain 0.02
 
 # All three layers, with a chronological held-out test
-python main.py --boosting --constant-opt --joint-refit --validation-mode sequential
+python main.py --constant-opt --joint-refit --validation-mode sequential
 
-# Layer 2 alone: refine the constants of an ordinary front
-python main.py --constant-opt
+# Layer 2 alone: refine the constants of a single ordinary fit
+python main.py --no-boosting --constant-opt
 ```
 
-When `--boosting` is combined with a `--metric` other than `mse`, terms are
-still selected using that metric, but the boosted front's points are reported in
+When boosting is combined with a `--metric` other than `mse`, terms are still
+selected using that metric, but the boosted front's points are reported in
 MSE.
 
 ## Operator tokens
