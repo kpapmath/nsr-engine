@@ -257,6 +257,49 @@ front = engine.fit_memmap(store, train_lo=0, train_hi=store.n_rows)
 | `affine_reward` | True | Score residuals after a least-squares affine fit |
 | `score_metric` | `"mse"` | Accuracy metric: `"mse"`, `"rmse"`, `"mae"`, `"mape"`, `"mbd"`, `"r2"`, or `"adjusted_r2"` |
 | `cache_dir` | None | Cache lambda runs to disk (JSON) |
+| `save_front` | True | Write the front `fit` returns to `front_dir` as CSV |
+| `front_dir` | `"nsr_pareto_front"` | Where that file goes, created on demand |
+
+## Saved fronts
+
+`fit` writes the front it returns to `nsr_pareto_front/` as CSV — one file per
+fit, named `[<cache_prefix>-]front-<timestamp>-seed<random_state>.csv`, and an
+existing file is never overwritten. A search costs minutes to hours, so the
+default is to keep its result rather than let it live only in the returned
+object.
+
+```python
+engine = NSREngine(n_iters=200)
+front = engine.fit(X, y)
+print(engine.front_path_)      # nsr_pareto_front/front-20260922-174706-seed42.csv
+```
+
+| Column | |
+|---|---|
+| `point` | position in the front, ordered by complexity as `to_frame()` orders it |
+| `complexity` | the point's complexity |
+| `score_metric` / `score` | the metric dominance was decided on, and its value |
+| `is_elbow` | 1 on the point `front.elbow()` returns |
+| `fit_rows` / `fit_rmse` / `fit_r2` | scored on the data the fit saw, from the returned SymPy expression; `fit_rows` is how many rows the expression was finite on |
+| `equation` | the expression, in full |
+
+`fit_rmse` and `fit_r2` are **in-sample**. A front is a menu of
+accuracy/complexity trade-offs, and picking between its points on in-sample
+error alone lands on the most complex one every time — score the candidates on
+held-out data for that.
+
+Turn it off with `save_front=False`, or move it with
+`front_dir="somewhere/else"`. Writing is best-effort: if the directory is not
+writable the fit still returns its front, with a warning. Under boosting the
+per-round fronts are merged into the one that gets saved, so a fit writes one
+file, not one per round. Any front can be written directly:
+
+```python
+front.save("front.csv", X=X, y=y)       # X/y optional; they fill in fit_* columns
+```
+
+The CLI does the same, with `--front-dir` and `--no-save-front`; it saves the
+front *after* the accuracy layers it applied, which is the one it prints.
 
 ## Scoring metrics
 

@@ -1052,6 +1052,24 @@ class NSREngine:
     cache_dir:
         Directory for caching discovered candidates (JSON per lambda).
         If ``None``, no cache is written.
+    save_front:
+        New in 0.8.1.  Write the front ``fit`` returns to ``front_dir`` as a
+        CSV, one file per fit, named
+        ``[<cache_prefix>-]front-<timestamp>-seed<random_state>.csv``.  **On by
+        default**: a front is the result of a search that costs minutes to
+        hours, and until 0.8.1 it existed only as the returned object, so a
+        session that ended without saving it had to search again.  An existing
+        file is never overwritten -- a name already taken gets ``-2``, ``-3``
+        and so on.  Writing is best-effort: a failure (read-only directory, no
+        space) prints a warning and returns the front unharmed, since losing a
+        file is not a reason to lose the fit.  Pass ``False`` to keep ``fit``
+        free of side effects.  See :meth:`~nsr_engine.ParetoFront.save` for the
+        columns; ``fit`` passes the fitted ``X``/``y``, so ``fit_rmse`` and
+        ``fit_r2`` are filled in.
+    front_dir:
+        New in 0.8.1.  Where ``save_front`` writes, created on demand.
+        Relative paths resolve against the working directory; the default is
+        ``nsr_pareto_front``.  Ignored when ``save_front=False``.
     standardize:
         Master switch for per-column feature scaling.  ``False`` trains on the
         raw columns and ``scale_mode`` is then irrelevant.
@@ -1215,6 +1233,8 @@ class NSREngine:
         random_state: int = 42,
         cache_dir: str | Path | None = None,
         cache_prefix: str | None = None,
+        save_front: bool = True,
+        front_dir: str | Path = "nsr_pareto_front",
         binary_ops: tuple[str, ...] | list[str] | None = None,
         unary_ops: tuple[str, ...] | list[str] | None = None,
         const_tokens: tuple[str, ...] | list[str] | None = None,
@@ -1318,6 +1338,10 @@ class NSREngine:
         self.random_state = random_state
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.cache_prefix = cache_prefix
+        self.save_front = bool(save_front)
+        self.front_dir = Path(front_dir)
+        # Set by `fit` to the file it wrote, or None when nothing was written.
+        self.front_path_: Path | None = None
         self.binary_ops = tuple(binary_ops) if binary_ops is not None else _BINARY_OPS
         if unary_ops is not None:
             unknown = [op for op in unary_ops if op not in _SUPPORTED_UNARY_OPS]
@@ -1544,8 +1568,11 @@ class NSREngine:
         which is a strictly smaller front than the same search un-boosted.
         """
         if not self.boosting or self.boosting_max_rounds < 2:
-            return self._fit_single(X, y)
-        return self._fit_boosted(X, y)
+            front = self._fit_single(X, y)
+        else:
+            front = self._fit_boosted(X, y)
+        self._save_front(front, X, y)
+        return front
 
     def _fit_boosted(self, X: pd.DataFrame, y: pd.Series) -> ParetoFront:
         """Greedy additive boosting over fresh per-round engines (layer 1)."""
@@ -1611,6 +1638,10 @@ class NSREngine:
         engine = copy.copy(self)
         engine.boosting = False
         engine.random_state = self.random_state + round_idx
+        # One file per `fit` the caller asked for: the round fronts are merged
+        # into the front this engine is about to save, so saving them too would
+        # write `boosting_max_rounds` files nobody asked for.
+        engine.save_front = False
         if self.cache_prefix is not None:
             engine.cache_prefix = f"{self.cache_prefix}_round{round_idx}"
         engine.boost_rounds_ = []
@@ -1731,6 +1762,12 @@ class NSREngine:
         full train range by streaming contiguous chunks, then dominance-filtered.
 
         ``step_subsample_size`` must be set; it defaults to 50_000 if None.
+
+        The front is saved like ``fit``'s (see ``save_front``), minus the
+        ``fit_rmse``/``fit_r2`` columns: the train range is never in memory, and
+        measuring them on the refit subsample would put a different quantity
+        under the same name.  The ``score`` column still comes from exact
+        scoring over every row.
         """
         from nsr_engine.memmap_store import chunk_ranges
 
@@ -1776,7 +1813,9 @@ class NSREngine:
         pool = self._sweep_lambdas(lib, sample_step, device)
         if not pool:
             print("[nsr] warning: no valid expressions discovered — empty front")
-            return ParetoFront([])
+            front = ParetoFront([])
+            self._save_front(front)
+            return front
 
         candidates = self._select_for_exact_scoring(
             list(pool.values()), per_complexity=per_complexity
@@ -1809,6 +1848,7 @@ class NSREngine:
                  for col in store.feature_cols}
             )
             front = self._maybe_refine(X=X_sub, y=pd.Series(sub_y), front=front)
+        self._save_front(front)
         return front
 
     # ------------------------------------------------------------------
@@ -2393,6 +2433,47 @@ class NSREngine:
     # ------------------------------------------------------------------
     # Cache helpers
     # ------------------------------------------------------------------
+
+    def _front_path(self) -> Path:
+        """A fresh file under ``front_dir``; never clobbers an existing one."""
+        import time
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        prefix = f"{self.cache_prefix}-" if self.cache_prefix else ""
+        stem = f"{prefix}front-{stamp}-seed{self.random_state}"
+        path = self.front_dir / f"{stem}.csv"
+        n = 2
+        while path.exists():
+            path = self.front_dir / f"{stem}-{n}.csv"
+            n += 1
+        return path
+
+    def _save_front(
+        self,
+        front: ParetoFront,
+        X: pd.DataFrame | None = None,
+        y: pd.Series | None = None,
+    ) -> None:
+        """Write ``front`` to ``front_dir`` unless the caller opted out.
+
+        ``X``/``y`` fill in the per-point ``fit_*`` columns; out-of-core they
+        are left out rather than measured on a subsample, which would report a
+        different quantity under the same column name.
+        """
+        self.front_path_ = None
+        if not self.save_front:
+            return
+        try:
+            path = front.save(self._front_path(), X=X, y=y)
+        except Exception as exc:    # a file is never worth failing a fit over
+            print(
+                f"[nsr] warning: could not save the Pareto front to "
+                f"{self.front_dir}: {exc!r}",
+                flush=True,
+            )
+            return
+        self.front_path_ = path
+        print(f"[nsr] Pareto front saved: {path}", flush=True)
 
     def _cache_path(self, lambda_idx: int) -> Path | None:
         if self.cache_dir is None:

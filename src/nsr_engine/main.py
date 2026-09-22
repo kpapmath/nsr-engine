@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import time
 from pathlib import Path
 
 from nsr_engine import (
@@ -193,6 +194,22 @@ def parse_args() -> argparse.Namespace:
     engine.add_argument("--random-state", type=int, default=None)
     engine.add_argument("--cache-dir", type=Path, default=None)
     engine.add_argument("--cache-prefix", default="full_pipeline")
+    engine.add_argument(
+        "--front-dir",
+        type=Path,
+        default=Path("nsr_pareto_front"),
+        help="Directory the Pareto front is written to (created on demand).",
+    )
+    _add_bool_arg(
+        engine,
+        "save_front",
+        default=True,
+        help_text=(
+            "Save the printed Pareto front to --front-dir as CSV (default). "
+            "One file per front, never overwriting an existing one."
+        ),
+        disable_help_text="Print the Pareto front without writing it to disk.",
+    )
     engine.add_argument("--binary-ops", type=_csv_list, default=None)
     engine.add_argument("--unary-ops", type=_csv_list, default=None)
     engine.add_argument("--const-tokens", type=_csv_list, default=None)
@@ -394,6 +411,10 @@ def _build_engine(args: argparse.Namespace, *, cache_prefix: str | None = None) 
     """
     return NSREngine(
         boosting=False,
+        # The CLI applies the accuracy layers *after* the fit and saves the
+        # front it finally prints, which is not the one the engine would write
+        # here -- and under boosting there would be one file per round.
+        save_front=False,
         lambda_grid=args.lambda_grid,
         n_lambda=args.n_lambda,
         lambda_min=args.lambda_min,
@@ -510,6 +531,29 @@ def _fit_front(args: argparse.Namespace, X, y, *, cache_prefix: str | None = Non
     return ParetoFront(points).dominance_filter()
 
 
+def _save_front(args: argparse.Namespace, front, X, y, *, stem: str) -> None:
+    """Write ``front`` to ``--front-dir`` unless ``--no-save-front``.
+
+    The CLI saves here rather than letting the engine do it: what it reports
+    is the front *after* whichever accuracy layers were enabled, and under
+    boosting the engine would otherwise write one file per round.
+    """
+    if not args.save_front or len(front) == 0:
+        return
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = args.front_dir / f"{stem}-front-{stamp}.csv"
+    n = 2
+    while path.exists():
+        path = args.front_dir / f"{stem}-front-{stamp}-{n}.csv"
+        n += 1
+    try:
+        front.save(path, X=X, y=y)
+    except Exception as exc:        # never fail a finished run over a file
+        print(f"[nsr] warning: could not save the Pareto front: {exc!r}")
+        return
+    print(f"[nsr] Pareto front saved: {path}")
+
+
 def _print_selected_front(front, *, title: str) -> object:
     if len(front) == 0:
         raise RuntimeError(
@@ -559,6 +603,8 @@ def _run_validation_folds(args: argparse.Namespace, X, y) -> None:
         if len(front) == 0:
             print(f"{fold.name}_rmse=nan")
             continue
+        _save_front(args, front, fold.X_train, fold.y_train,
+                    stem=f"{args.cache_prefix}_{fold.name}")
         selected = front.elbow()
         fold_rmse = evaluate_with_sympy(selected.sympy_expr, fold.X_eval, fold.y_eval)
         if fold_rmse is not None:
@@ -597,6 +643,7 @@ def main() -> None:
         )
         front = _fit_front(args, X_train, y_train)
         selected = _print_selected_front(front, title="Pareto front")
+        _save_front(args, front, X_train, y_train, stem=args.cache_prefix)
 
         if X_validation is not None and y_validation is not None:
             validation_rmse = evaluate_with_sympy(
@@ -614,6 +661,7 @@ def main() -> None:
 
     front = _fit_front(args, X, y)
     _print_selected_front(front, title="Pareto front")
+    _save_front(args, front, X, y, stem=args.cache_prefix)
 
 
 if __name__ == "__main__":

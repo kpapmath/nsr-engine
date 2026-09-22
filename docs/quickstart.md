@@ -68,7 +68,14 @@ front = engine.fit(X, y)
 
 print(front.to_frame())
 print("elbow formula:", front.elbow().equation)
+
+# The whole front is also written to nsr_pareto_front/ as CSV -- complexity,
+# score, which point is the elbow, and each point's RMSE/R2 on the fitted data.
+print("saved to:", engine.front_path_)
 ```
+
+Pass `save_front=False` to turn that off, or `front_dir="somewhere/else"` to
+move it.
 
 ## Full Pipeline Example
 
@@ -270,7 +277,9 @@ These are the constructor arguments accepted by `NSREngine(...)`.
 | `lr` | `1e-3` | Adam optimizer learning rate. |
 | `random_state` | `42` | Base random seed. Lambda run `i` uses `random_state + i`. |
 | `cache_dir` | `None` | Directory for JSON candidate caches. When set, discovered candidates are saved per lambda and reused on later runs. |
-| `cache_prefix` | `None` | Optional prefix added to cache file names. Useful when sharing one cache directory across experiments. |
+| `cache_prefix` | `None` | Optional prefix added to cache file names. Useful when sharing one cache directory across experiments. Also the stem of the saved front's file name. |
+| `save_front` | `True` | Write the front `fit` returns to `front_dir` as CSV, one file per fit, never overwriting an existing one. `False` keeps `fit` free of side effects. |
+| `front_dir` | `"nsr_pareto_front"` | Directory that file goes in, created on demand. Relative paths resolve against the working directory. |
 | `binary_ops` | `("+", "-", "*", "/")` | Binary operators available to the expression grammar. The four arithmetic operators are the full supported set. |
 | `unary_ops` | `("square", "abs", "log")` | Unary operators available to the expression grammar. Extra operators (`sqrt`, `cbrt`, `exp`, `log10`, `log2`, `sin`, `cos`, `tan`, `sinh`, `cosh`, `tanh`, `arcsin`, `arccos`, `arctan`, `arcsinh`, `arctanh`, `sigmoid`, `neg`, `sign`, `cube`, `reciprocal`) can be opted in. Unknown names raise a `ValueError`. See the [CLI reference](cli_reference.md#unary-operators). |
 | `const_tokens` | `("-1.0", "-0.5", "0.5", "1.0", "2.0")` | Constant terminal tokens available to sampled expressions. Values are parsed with `float(...)`. |

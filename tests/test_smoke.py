@@ -1,5 +1,7 @@
 """Smoke tests: import, fit on a tiny synthetic dataset, check front shape."""
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -278,6 +280,164 @@ def test_split_fraction_range_validation():
 def test_split_fraction_sum_validation():
     with pytest.raises(ValueError, match="sum to 1.0"):
         validate_split_fractions(0.7, 0.2, None)
+
+
+# ---------------------------------------------------------------------------
+# Saving the front
+# ---------------------------------------------------------------------------
+def _tiny_engine(**kwargs) -> NSREngine:
+    params = dict(
+        n_lambda=2, n_iters=5, batch_size=16, max_len=5, random_state=0,
+        boosting=False,
+    )
+    params.update(kwargs)
+    return NSREngine(**params)
+
+
+def test_fit_saves_the_front_by_default(tmp_path):
+    """The search costs minutes to hours; its result must outlive the process."""
+    X, y = _make_data()
+    engine = _tiny_engine()
+
+    front = engine.fit(X, y)
+
+    saved = sorted((tmp_path / "nsr_pareto_front").glob("*.csv"))
+    assert len(saved) == 1, "exactly one file per fit"
+    # `front_path_` is relative when `front_dir` is, as it is by default.
+    assert engine.front_path_.resolve() == saved[0].resolve()
+    frame = pd.read_csv(saved[0])
+    assert list(frame.columns) == ParetoFront.SAVE_COLUMNS
+    assert len(frame) == len(front)
+
+
+def test_no_save_front_leaves_the_filesystem_alone(tmp_path):
+    X, y = _make_data()
+    engine = _tiny_engine(save_front=False)
+
+    engine.fit(X, y)
+
+    assert not (tmp_path / "nsr_pareto_front").exists()
+    assert engine.front_path_ is None
+
+
+def test_front_dir_redirects_the_file(tmp_path):
+    X, y = _make_data()
+    engine = _tiny_engine(front_dir=tmp_path / "somewhere" / "else")
+
+    engine.fit(X, y)
+
+    assert engine.front_path_.parent == tmp_path / "somewhere" / "else"
+    assert not (tmp_path / "nsr_pareto_front").exists()
+
+
+def test_a_failed_save_does_not_fail_the_fit(tmp_path, capsys):
+    """A file is not worth losing a fit that took minutes to compute."""
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a directory")
+    X, y = _make_data()
+    engine = _tiny_engine(front_dir=blocker)
+
+    front = engine.fit(X, y)
+
+    assert isinstance(front, ParetoFront)
+    assert engine.front_path_ is None
+    assert "could not save" in capsys.readouterr().out
+
+
+def test_saving_never_overwrites_an_earlier_front(tmp_path):
+    X, y = _make_data()
+    engine = _tiny_engine()
+
+    first = engine.fit(X, y) and engine.front_path_
+    second = engine.fit(X, y) and engine.front_path_
+
+    assert first != second
+    assert first.exists() and second.exists()
+
+
+def test_boosting_saves_one_file_not_one_per_round(tmp_path):
+    """Round fronts are merged into the saved front; they are not files."""
+    X, y = _make_data()
+    engine = _tiny_engine(boosting=True, boosting_max_rounds=2, n_lambda=1, n_iters=3)
+
+    engine.fit(X, y)
+
+    assert len(list((tmp_path / "nsr_pareto_front").glob("*.csv"))) == 1
+
+
+def test_saved_front_marks_the_elbow_and_scores_every_point():
+    """`is_elbow` names the point `elbow()` picks; metrics come from the data."""
+    import sympy as sp
+
+    from nsr_engine.pareto import ParetoPoint
+
+    a = sp.Symbol("a")
+    X = pd.DataFrame({"a": np.linspace(1.0, 5.0, 50)})
+    y = pd.Series(2.0 * X["a"].to_numpy())
+    pts = [
+        ParetoPoint(equation="a", sympy_expr=a, complexity=1, mse=1.0),
+        ParetoPoint(equation="2*a", sympy_expr=2 * a, complexity=3, mse=0.0),
+        ParetoPoint(equation="log(-a)", sympy_expr=sp.log(-a), complexity=5, mse=0.5),
+    ]
+    front = ParetoFront(pts)
+
+    frame = front.to_save_frame(X=X, y=y)
+
+    assert list(frame["complexity"]) == [1, 3, 5]      # ordered as to_frame orders
+    assert list(frame["is_elbow"]) == [0, 1, 0]
+    assert frame.loc[1, "fit_rmse"] == pytest.approx(0.0, abs=1e-9)
+    assert frame.loc[1, "fit_r2"] == pytest.approx(1.0)
+    assert frame.loc[1, "fit_rows"] == 50
+    # Undefined on every row, yet still accounted for rather than dropped.
+    assert frame.loc[2, "fit_rows"] == 0
+    assert np.isnan(frame.loc[2, "fit_rmse"])
+
+
+def test_saved_front_without_data_omits_the_fit_metrics(tmp_path):
+    from nsr_engine.pareto import ParetoPoint
+
+    front = ParetoFront([
+        ParetoPoint(equation="a", sympy_expr=None, complexity=1, mse=0.5),
+    ])
+
+    path = front.save(tmp_path / "sub" / "front.csv")
+
+    frame = pd.read_csv(path)
+    assert frame.loc[0, "fit_rows"] == 0
+    assert np.isnan(frame.loc[0, "fit_rmse"])
+    assert frame.loc[0, "score"] == 0.5
+
+
+def test_empty_front_saves_a_header_only(tmp_path):
+    path = ParetoFront([]).save(tmp_path / "front.csv")
+
+    frame = pd.read_csv(path)
+    assert list(frame.columns) == ParetoFront.SAVE_COLUMNS
+    assert len(frame) == 0
+
+
+def test_cli_saves_the_front_by_default(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["nsr-engine"])
+
+    args = parse_args()
+
+    assert args.save_front is True
+    assert args.front_dir == Path("nsr_pareto_front")
+
+
+def test_cli_no_save_front_opts_out(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["nsr-engine", "--no-save-front"])
+
+    assert parse_args().save_front is False
+
+
+def test_cli_engines_do_not_save_the_unrefined_front(monkeypatch):
+    """The CLI saves what it prints -- after the accuracy layers, once."""
+    from nsr_engine.main import _build_engine
+
+    monkeypatch.setattr("sys.argv", ["nsr-engine"])
+
+    assert _build_engine(parse_args()).save_front is False
 
 
 def test_pareto_front_dominance_filter():

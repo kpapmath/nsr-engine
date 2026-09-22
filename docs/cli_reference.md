@@ -57,6 +57,14 @@ Enable extra unary operators and pick a different accuracy metric:
 python main.py --unary-ops square,abs,log,sqrt,sin,cos,tanh --metric r2
 ```
 
+The front is saved to `nsr_pareto_front/` as CSV unless you say otherwise —
+the whole front, not just the elbow the run prints:
+
+```bash
+python main.py --front-dir runs/2026-09-22   # elsewhere
+python main.py --no-save-front               # nowhere
+```
+
 ## Data arguments
 
 | Argument | Default | Available options | Explanation |
@@ -93,7 +101,9 @@ python main.py --unary-ops square,abs,log,sqrt,sin,cos,tanh --metric r2
 | `--lr` | `1e-3` | Any positive float | Adam learning rate. |
 | `--random-state` | `None` | Any integer or unset | Engine random seed. Defaults to `--seed` when omitted. |
 | `--cache-dir` | `None` | Path to a directory | Directory for JSON candidate caches. |
-| `--cache-prefix` | `"full_pipeline"` | Any string | Cache filename prefix. |
+| `--cache-prefix` | `"full_pipeline"` | Any string | Cache filename prefix, and the stem of the saved front's filename. |
+| `--front-dir` | `nsr_pareto_front` | Path to a directory | Where the Pareto front CSV is written. Created on demand. |
+| `--save-front` / `--no-save-front` | saving on | flag | Write the reported front to `--front-dir`, one file per front, never overwriting an existing one. `--no-save-front` prints it and writes nothing. |
 | `--binary-ops` | `+,-,*,/` | Subset of `+ - * /` | Comma-separated binary operators. See [Operator tokens](#operator-tokens). |
 | `--unary-ops` | `square,abs,log` | Subset of the [available unary ops](#operator-tokens) | Comma-separated unary operators. |
 | `--const-tokens` | `-1.0,-0.5,0.5,1.0,2.0` | Comma-separated `float(...)`-parseable values | Constant terminal tokens. |
