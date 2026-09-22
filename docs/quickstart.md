@@ -383,7 +383,7 @@ and source file signatures match.
 | Method | Arguments | Explanation |
 | --- | --- | --- |
 | `front.to_frame()` | none | Returns a `pandas.DataFrame` with `equation`, `complexity`, and the selected metric column sorted by complexity. |
-| `front.elbow()` | none | Returns the point with the largest score drop per unit complexity increase. |
+| `front.elbow()` | none | Returns the point with the largest score drop per unit complexity increase. Raises `ValueError` on an empty front — guard with `len(front)` where a search may find nothing. |
 | `front.dominance_filter()` | none | Returns a new front containing only non-dominated points. |
 | `len(front)` | none | Returns the number of points in the front. |
 
