@@ -264,4 +264,14 @@ class ResidualBoostedNSR:
 
         # Non-dominated by construction: complexity strictly increases and the
         # training residual metric strictly decreases on every kept round.
-        return ParetoFront(points)
+        #
+        # Every `break` above leaves `points` untouched, so a booster whose
+        # first round is rejected returns an empty front.  Carry the reason the
+        # round was rejected into it: `elbow()` quotes it, which turns an
+        # opaque failure deep in the caller into the actual cause ("model
+        # scored no finite rows").
+        reason: str | None = None
+        if not points and self.rounds_:
+            last = self.rounds_[-1]
+            reason = f"boosting round {last['round']} rejected: {last['reason']}"
+        return ParetoFront(points, empty_reason=reason)

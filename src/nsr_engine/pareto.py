@@ -32,10 +32,29 @@ class ParetoPoint:
 
 
 class ParetoFront:
-    """Collection of (equation, complexity, score) points on a Pareto front."""
+    """Collection of (equation, complexity, score) points on a Pareto front.
 
-    def __init__(self, points: list[ParetoPoint]) -> None:
+    Parameters
+    ----------
+    points:
+        The front's points.
+    empty_reason:
+        New in 0.8.1.  Optional diagnostic explaining *why* a front came back
+        empty, quoted by :meth:`elbow` so the caller reads the cause rather
+        than a bare "no candidate was accepted".  Producers that know the
+        reason -- :class:`~nsr_engine.boosting.ResidualBoostedNSR` records the
+        rejection of every round in ``rounds_`` -- pass it here.  Ignored when
+        ``points`` is non-empty.
+    """
+
+    def __init__(
+        self,
+        points: list[ParetoPoint],
+        *,
+        empty_reason: str | None = None,
+    ) -> None:
         self.points = points
+        self.empty_reason = empty_reason
 
     def dominance_filter(self) -> ParetoFront:
         """Return a new front keeping only non-dominated points.
@@ -58,10 +77,26 @@ class ParetoFront:
                     break
             if not dominated:
                 keep.append(pt)
-        return ParetoFront(keep)
+        return ParetoFront(keep, empty_reason=self.empty_reason)
 
     def elbow(self) -> ParetoPoint:
-        """Return the point with the highest score drop per complexity increase."""
+        """Return the point with the highest score drop per complexity increase.
+
+        Raises
+        ------
+        ValueError
+            If the front is empty.  An empty front is not a degenerate elbow but
+            a failed search: no candidate was ever accepted, and there is no
+            point to return.  Raising here keeps the failure at its cause
+            instead of handing back ``None`` for a caller to trip over one
+            attribute access later.  Callers that can legitimately see an empty
+            front guard with ``len(front)`` first.
+        """
+        if not self.points:
+            raise ValueError(
+                "elbow() on an empty Pareto front; no candidate was accepted"
+                + (f" ({self.empty_reason})" if self.empty_reason else "")
+            )
         sorted_pts = sorted(self.points, key=lambda p: p.complexity)
         if len(sorted_pts) == 1:
             return sorted_pts[0]

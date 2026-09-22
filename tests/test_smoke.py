@@ -307,6 +307,46 @@ def test_pareto_front_elbow():
     assert elbow.equation == "b"
 
 
+def test_pareto_front_elbow_empty_raises():
+    with pytest.raises(ValueError, match="empty Pareto front"):
+        ParetoFront([]).elbow()
+
+
+def test_pareto_front_elbow_empty_quotes_reason():
+    front = ParetoFront([], empty_reason="boosting round 1 rejected: no finite rows")
+    with pytest.raises(ValueError, match="boosting round 1 rejected: no finite rows"):
+        front.elbow()
+
+
+def test_boosted_rejecting_every_round_returns_empty_front_with_reason():
+    """A booster whose every round is rejected must explain itself.
+
+    Round 1 is unconditionally kept *unless* the front is empty, so a weak
+    learner that discovers nothing is the path that leaves `points` untouched.
+    The empty front must then say which round failed and why, rather than
+    leaving `elbow()` to raise a bare IndexError from the library's insides.
+    """
+    from nsr_engine.boosting import ResidualBoostedNSR
+
+    X, y = _make_data(n=50)
+    booster = ResidualBoostedNSR(
+        lambda k: _EmptyFrontEngine(), max_rounds=3, min_gain=0.01
+    )
+    front = booster.fit(X, y)
+
+    assert len(front) == 0
+    assert booster.rounds_[-1]["reason"] == "empty front"
+    with pytest.raises(ValueError, match="boosting round 1 rejected: empty front"):
+        front.elbow()
+
+
+class _EmptyFrontEngine:
+    """Weak learner that discovers nothing, as a failed NSR round does."""
+
+    def fit(self, X, y):
+        return ParetoFront([])
+
+
 def test_pareto_front_to_frame_uses_metric_column():
     from nsr_engine.pareto import ParetoPoint
 
