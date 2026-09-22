@@ -175,7 +175,9 @@ The CLI exposes data, split, engine, and accuracy-layer options.
 | `--const-tokens` | engine default | Comma-separated constant tokens. |
 | `--device` | `"auto"` | Torch device string such as `"auto"`, `"cpu"`, or `"cuda"`. |
 | `--step-subsample-size` | `None` | Rows used for each training reward calculation. Accepts an integer or `none`. |
-| `--standardize` / `--no-standardize` | `True` | Enable or disable feature z-scoring. |
+| `--standardize` / `--no-standardize` | `True` | Enable or disable per-column feature scaling. |
+| `--scale-mode` | `zscore` | `zscore`, `scale`, `minmax`, `geometric`, `log`, or `none`. The middle three keep a strictly positive column positive; `zscore` centers and so does not. |
+| `--minmax-range` | `0.001,1` | Target interval of `--scale-mode minmax`. |
 | `--affine-reward` / `--no-affine-reward` | `True` | Enable or disable least-squares affine scoring. |
 | `--metric`, `--score-metric` | `"mse"` | Score metric passed to `NSREngine`. |
 | `--prefilter-per-complexity` | `16` | Candidates kept per complexity, ranked by exact score, before SymPy conversion. |
@@ -274,7 +276,9 @@ These are the constructor arguments accepted by `NSREngine(...)`.
 | `const_tokens` | `("-1.0", "-0.5", "0.5", "1.0", "2.0")` | Constant terminal tokens available to sampled expressions. Values are parsed with `float(...)`. |
 | `device` | `"auto"` | Torch device. `"auto"` selects CUDA, then Apple MPS, then CPU. You may also pass values such as `"cpu"` or `"cuda"`. |
 | `step_subsample_size` | `None` | Number of rows used for each training iteration reward calculation. For in-memory `fit`, `None` means use all rows. For `fit_memmap`, `None` is treated as `50_000`. |
-| `standardize` | `True` | Whether feature columns are z-scored before training. Returned SymPy formulas are converted back to raw feature terms when possible. |
+| `standardize` | `True` | Whether feature columns are scaled before training. Returned SymPy formulas are converted back to raw feature terms when possible, in every scale mode. |
+| `scale_mode` | `"zscore"` | How feature columns are scaled: `"zscore"` `(x-mean)/std`, `"scale"` `x/rms`, `"minmax"`, `"geometric"` `(x/GM)**(1/std_log)`, or `"log"`. On positive-only data prefer `"scale"` or `"geometric"` — `"zscore"` centers, and the negative half of each column lands in the domain guards of `log`/`sqrt`/`pow`. |
+| `minmax_range` | `(1e-3, 1.0)` | Target interval of `scale_mode="minmax"`; a positive lower bound keeps the column positive. |
 | `affine_reward` | `True` | Whether rewards and final scoring use a least-squares affine fit `b0 + b1 * expression` before applying `score_metric`. This makes scoring less sensitive to expression scale and offset. |
 | `score_metric` | `"mse"` | Accuracy metric. Supported values are `"mse"`, `"rmse"`, `"mae"`, `"mape"`, `"mbd"`, `"r2"`, and `"adjusted_r2"`. |
 | `prefilter_per_complexity` | `16` | Number of best candidates to keep per complexity, ranked by exact full-set score, before SymPy conversion. |

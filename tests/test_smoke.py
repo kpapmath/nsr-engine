@@ -336,3 +336,174 @@ def test_pareto_front_maximizes_r2():
 
     assert [p.equation for p in front.points] == ["b"]
     assert front.to_frame()["r2"].iloc[0] == pytest.approx(0.8)
+
+
+# ----------------------------------------------------------------------
+# Feature scaling modes
+# ----------------------------------------------------------------------
+
+
+def _positive_frame(n: int = 400, seed: int = 11) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame(
+        {
+            "a": rng.lognormal(2.0, 1.5, n).astype(np.float32),  # many decades
+            "b": rng.uniform(0.5, 9.0, n).astype(np.float32),
+        }
+    )
+
+
+def _scaled(engine: NSREngine, X: pd.DataFrame) -> dict[str, np.ndarray]:
+    arrays = {col: X[col].to_numpy(dtype=np.float32, copy=True) for col in X.columns}
+    engine._set_stats_from_arrays(arrays)
+    return engine._standardize_arrays(arrays, inplace=True)
+
+
+@pytest.mark.parametrize("mode", ["scale", "minmax", "geometric"])
+def test_scale_modes_keep_a_positive_column_positive(mode):
+    """The point of the non-zscore modes: no centering out of the positive orthant."""
+    X = _positive_frame()
+    scaled = _scaled(NSREngine(scale_mode=mode), X)
+
+    for col, arr in scaled.items():
+        assert arr.min() > 0.0, f"{mode} sent column {col} non-positive"
+
+
+@pytest.mark.parametrize("mode", ["zscore", "log"])
+def test_centering_modes_do_not_keep_the_domain(mode):
+    """The contrast the other three exist for — asserted so it cannot drift silently."""
+    scaled = _scaled(NSREngine(scale_mode=mode), _positive_frame())
+
+    assert min(arr.min() for arr in scaled.values()) < 0.0
+
+
+def test_minmax_lands_on_the_requested_range():
+    X = _positive_frame()
+    scaled = _scaled(NSREngine(scale_mode="minmax", minmax_range=(0.25, 4.0)), X)
+
+    for arr in scaled.values():
+        assert arr.min() == pytest.approx(0.25, rel=1e-5)
+        assert arr.max() == pytest.approx(4.0, rel=1e-5)
+
+
+def test_scale_mode_scale_preserves_ratios():
+    """Scale-only is multiplicative, so row-to-row ratios come through untouched."""
+    X = _positive_frame()
+    scaled = _scaled(NSREngine(scale_mode="scale"), X)
+
+    raw = X["a"].to_numpy(dtype=np.float64)
+    got = scaled["a"].astype(np.float64)
+    assert np.allclose(got / got[0], raw / raw[0], rtol=1e-4)
+
+
+def test_geometric_mode_centers_on_the_geometric_mean():
+    scaled = _scaled(NSREngine(scale_mode="geometric"), _positive_frame())
+
+    for arr in scaled.values():
+        logs = np.log(arr.astype(np.float64))
+        assert logs.mean() == pytest.approx(0.0, abs=1e-5)  # geometric mean 1
+        assert logs.std() == pytest.approx(1.0, rel=1e-4)
+
+
+@pytest.mark.parametrize("mode", ["geometric", "log"])
+def test_log_space_modes_reject_non_positive_columns(mode):
+    engine = NSREngine(scale_mode=mode)
+    arrays = {"a": np.array([1.0, 2.0, -3.0], dtype=np.float32)}
+
+    with pytest.raises(ValueError, match="strictly positive"):
+        engine._set_stats_from_arrays(arrays)
+
+
+def test_scale_mode_validation():
+    with pytest.raises(ValueError, match="scale_mode must be one of"):
+        NSREngine(scale_mode="bogus")
+    with pytest.raises(ValueError, match="lo < hi"):
+        NSREngine(minmax_range=(2.0, 1.0))
+
+
+@pytest.mark.parametrize("mode", ["zscore", "scale", "minmax", "geometric", "log"])
+def test_scaled_expressions_convert_back_to_raw_features(mode):
+    """The scaling must not leak into the reported equation, in any mode."""
+    sp = pytest.importorskip("sympy")
+    from nsr_engine.engine import _eval_prefix_numpy, _to_sympy_affine
+
+    X = _positive_frame(n=200)
+    tokens = ["+", "*", "a", "b", "log", "a"]
+    b0, b1 = 0.37, 2.1
+
+    engine = NSREngine(scale_mode=mode)
+    scaled = _scaled(engine, X)
+    on_scaled = b0 + b1 * _eval_prefix_numpy(tokens, scaled, len(X)).astype(np.float64)
+
+    converted = _to_sympy_affine(
+        tokens, b0, b1, engine._feat_mean, engine._feat_std, feat_mode=mode
+    )
+    assert converted is not None
+    _, expr = converted
+    fn = sp.lambdify((sp.Symbol("a"), sp.Symbol("b")), expr, "numpy")
+    on_raw = np.asarray(
+        fn(X["a"].to_numpy(np.float64), X["b"].to_numpy(np.float64)), dtype=np.float64
+    )
+
+    # float32 scaling vs float64 substitution, so relative rather than exact.
+    assert np.allclose(on_raw, on_scaled, rtol=1e-3)
+
+
+@pytest.mark.parametrize("mode", ["zscore", "scale", "minmax", "geometric", "log"])
+def test_streaming_stats_match_in_memory_stats(mode):
+    """The out-of-core accumulators duplicate the math; keep the two in step."""
+    X = _positive_frame(n=997)
+
+    class _ChunkStore:
+        feature_cols = list(X.columns)
+
+        def gather(self, sl):
+            arrays = {c: X[c].to_numpy(np.float32)[sl].copy() for c in self.feature_cols}
+            return arrays, np.zeros(1)
+
+    in_memory = NSREngine(scale_mode=mode)
+    _scaled(in_memory, X)
+    streaming = NSREngine(scale_mode=mode)
+    streaming._set_stats_streaming(_ChunkStore(), 0, len(X), 100)
+
+    for col in X.columns:
+        assert streaming._feat_mean[col] == pytest.approx(in_memory._feat_mean[col])
+        assert streaming._feat_std[col] == pytest.approx(in_memory._feat_std[col])
+
+
+def test_cli_scale_mode_defaults_to_zscore(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["nsr-engine"])
+
+    args = parse_args()
+
+    assert args.scale_mode == "zscore"
+    assert args.minmax_range == (1e-3, 1.0)
+
+
+def test_cli_scale_mode_reaches_the_engine(monkeypatch):
+    from nsr_engine.main import _build_engine
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["nsr-engine", "--scale-mode", "minmax", "--minmax-range", "1,2"],
+    )
+    engine = _build_engine(parse_args())
+
+    assert engine.standardize is True
+    assert engine.scale_mode == "minmax"
+    assert engine.minmax_range == (1.0, 2.0)
+
+
+def test_cli_scale_mode_none_disables_scaling(monkeypatch):
+    from nsr_engine.main import _build_engine
+
+    monkeypatch.setattr("sys.argv", ["nsr-engine", "--scale-mode", "none"])
+
+    assert _build_engine(parse_args()).standardize is False
+
+
+def test_cli_rejects_an_inverted_minmax_range(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["nsr-engine", "--minmax-range", "5,1"])
+
+    with pytest.raises(SystemExit):
+        parse_args()

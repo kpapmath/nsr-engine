@@ -213,6 +213,17 @@ _SCORE_METRICS: tuple[str, ...] = (
 _METRIC_EPS = 1e-10
 _PREFILTER_METRICS: tuple[str, ...] = ("exact", "approx")
 
+# Per-column feature scaling modes, all fitted on the training rows only.
+# ``"zscore"`` is the historical behaviour.  The other three exist because it is
+# the *centering* that leaves a strictly positive domain: ``x - mean`` is
+# negative for roughly half the rows, so every log/sqrt/pow in the library
+# spends those rows in its domain guard instead of on signal.  On a positive-only
+# dataset the other modes condition the columns without leaving the positive
+# orthant.
+_SCALE_MODES: tuple[str, ...] = ("zscore", "scale", "minmax", "log", "geometric")
+# The two modes fitted in log space; ``"geometric"`` maps back out of it.
+_LOG_SCALE_MODES: frozenset[str] = frozenset({"log", "geometric"})
+
 
 def _get_arity(
     token: str,
@@ -514,12 +525,15 @@ def _to_sympy_affine(
     b1: float,
     feat_mean: dict[str, float] | None = None,
     feat_std: dict[str, float] | None = None,
+    feat_mode: str | None = None,
 ) -> tuple[str, Any] | None:
     """Convert a prefix token list to ``b0 + b1 * expr`` in *raw* feature terms.
 
-    If ``feat_mean``/``feat_std`` are given (standardization), every feature
+    If ``feat_mean``/``feat_std`` are given (feature scaling), every feature
     symbol ``f`` is substituted with ``(f - mean) / std`` so the returned
-    formula is expressed against the original columns.
+    formula is expressed against the original columns.  ``feat_mode`` names the
+    scale mode so the log-space ones invert correctly: ``"log"`` substitutes
+    ``(log(f) - mean) / std`` and ``"geometric"`` wraps that in ``exp``.
     """
     try:
         import sympy as sp
@@ -558,7 +572,9 @@ def _to_sympy_affine(
         if feat_mean is not None and tok in feat_mean:
             std = feat_std[tok] if feat_std is not None else 1.0
             std = std if abs(std) > 1e-12 else 1.0
-            return (sym - sp.Float(feat_mean[tok])) / sp.Float(std)
+            base = sp.log(sym) if feat_mode in _LOG_SCALE_MODES else sym
+            scaled = (base - sp.Float(feat_mean[tok])) / sp.Float(std)
+            return sp.exp(scaled) if feat_mode == "geometric" else scaled
         return sym
 
     expr = _rec()
@@ -964,6 +980,43 @@ class NSREngine:
     cache_dir:
         Directory for caching discovered candidates (JSON per lambda).
         If ``None``, no cache is written.
+    standardize:
+        Master switch for per-column feature scaling.  ``False`` trains on the
+        raw columns and ``scale_mode`` is then irrelevant.
+    scale_mode:
+        *How* the columns are scaled when ``standardize=True``.  Stats are
+        fitted on the training rows only and the returned SymPy formulas are
+        converted back to raw feature terms, so the choice never leaks into the
+        reported equation.
+
+        * ``"zscore"`` (default) -- ``(x - mean) / std``.  The historical
+          behaviour; it centers, so it does **not** preserve a positive domain.
+        * ``"scale"`` -- ``x / rms``.  Scale-only: no centering, so a strictly
+          positive column stays strictly positive and row-to-row *ratios* are
+          preserved.  A monomial target ``c * x1**a * x2**b`` keeps its exact
+          form under it, the rescaling being absorbed into ``c`` by the affine
+          reward's slope.  For a zero-mean column it coincides with ``"zscore"``.
+        * ``"minmax"`` -- affine onto ``minmax_range``.  Preserves positivity
+          when the range's lower bound is positive, but it shifts, so ratios and
+          power-law form are distorted; it is also the most outlier-sensitive
+          of the four.
+        * ``"geometric"`` -- the multiplicative analogue of ``"zscore"``:
+          ``(x / GM) ** (1 / std_log)``, the z-score taken in log space and
+          mapped back out of it.  It centers on the geometric mean and scales by
+          the multiplicative spread — what a positive column spanning several
+          orders of magnitude needs — and because of the final ``exp`` the
+          scaled column is again strictly positive, with geometric mean 1.
+          Requires strictly positive columns and raises otherwise.
+        * ``"log"`` -- the same z-score left *in* log space,
+          ``(log x - mean_log) / std_log``.  Best-conditioned of the five, but
+          the scaled column is signed, so it gives up the positive domain that
+          ``"geometric"`` keeps.  Nothing is lost by preferring ``"geometric"``
+          while ``log`` is in the unary library: one ``log`` token recovers this
+          column from that one.  Requires strictly positive columns.
+    minmax_range:
+        Target interval ``(lo, hi)`` of ``scale_mode="minmax"``.  The default
+        ``(1e-3, 1.0)`` keeps the scaled column strictly positive; ``lo <= 0``
+        is accepted but gives that up.
     score_metric:
         Accuracy metric. Supported values are ``"mse"``, ``"rmse"``,
         ``"mae"``, ``"mape"``, ``"mbd"``, ``"r2"``, and
@@ -1096,6 +1149,8 @@ class NSREngine:
         device: str = "auto",
         step_subsample_size: int | None = None,
         standardize: bool = True,
+        scale_mode: str = "zscore",
+        minmax_range: tuple[float, float] = (1e-3, 1.0),
         affine_reward: bool = True,
         count_affine_wrapper: bool = False,
         score_metric: str = "mse",
@@ -1157,6 +1212,15 @@ class NSREngine:
         if score_metric not in _SCORE_METRICS:
             supported = ", ".join(repr(m) for m in _SCORE_METRICS)
             raise ValueError(f"score_metric must be one of: {supported}")
+        scale_mode = scale_mode.lower()
+        if scale_mode not in _SCALE_MODES:
+            supported = ", ".join(repr(m) for m in _SCALE_MODES)
+            raise ValueError(f"scale_mode must be one of: {supported}")
+        mm_lo, mm_hi = float(minmax_range[0]), float(minmax_range[1])
+        if not mm_lo < mm_hi:
+            raise ValueError(
+                f"minmax_range must satisfy lo < hi (got {tuple(minmax_range)})"
+            )
         prefilter_metric = prefilter_metric.lower()
         if prefilter_metric not in _PREFILTER_METRICS:
             supported = ", ".join(repr(m) for m in _PREFILTER_METRICS)
@@ -1196,6 +1260,8 @@ class NSREngine:
         self.device_str = device
         self.step_subsample_size = step_subsample_size
         self.standardize = standardize
+        self.scale_mode = scale_mode
+        self.minmax_range = (mm_lo, mm_hi)
         self.affine_reward = affine_reward
         self.count_affine_wrapper = count_affine_wrapper
         self.score_metric = score_metric
@@ -1234,8 +1300,44 @@ class NSREngine:
         return torch.device(self.device_str)
 
     # ------------------------------------------------------------------
-    # Per-feature standardization
+    # Per-feature scaling
     # ------------------------------------------------------------------
+
+    def _require_positive(self, col: str, values: np.ndarray) -> None:
+        """Guard for the log-space modes, undefined off the positive orthant."""
+        if values.size and float(values.min()) <= 0.0:
+            raise ValueError(
+                f"scale_mode={self.scale_mode!r} requires strictly positive feature "
+                f"columns; column {col!r} contains values <= 0"
+            )
+
+    def _affine_params(
+        self, s1: float, s2: float, cnt: float, vmin: float, vmax: float
+    ) -> tuple[float, float]:
+        """Offset and scale of one column's map ``x -> (x - offset) / scale``.
+
+        Every mode is affine in the (for ``"log"``, log-transformed) column, so
+        all four share one representation — one transform, and one inverse
+        substitution when the front is converted back to raw feature terms.
+        """
+        if cnt <= 0:
+            return 0.0, 1.0
+        mean = s1 / cnt
+        if self.scale_mode == "zscore" or self.scale_mode in _LOG_SCALE_MODES:
+            std = math.sqrt(max(s2 / cnt - mean * mean, 0.0))
+            return mean, std if std > 1e-12 else 1.0
+        if self.scale_mode == "scale":
+            # No centering: divide by the RMS, which is exactly the z-score
+            # denominator for a zero-mean column.  Row-to-row ratios survive, so
+            # a monomial target keeps its form and the rescaling is absorbed by
+            # the affine reward's slope.
+            rms = math.sqrt(max(s2 / cnt, 0.0))
+            return 0.0, rms if rms > 1e-12 else 1.0
+        # minmax: map [vmin, vmax] onto [lo, hi].
+        lo, hi = self.minmax_range
+        span = vmax - vmin
+        scale = span / (hi - lo) if span > 1e-12 else 1.0
+        return vmin - lo * scale, scale
 
     def _set_stats_from_arrays(self, arrays: dict[str, np.ndarray]) -> None:
         if not self.standardize:
@@ -1244,13 +1346,19 @@ class NSREngine:
         std: dict[str, float] = {}
         for col, arr in arrays.items():
             finite = arr[np.isfinite(arr)]
+            if self.scale_mode in _LOG_SCALE_MODES:
+                self._require_positive(col, finite)
+                finite = np.log(finite.astype(np.float64))
             if finite.size == 0:
                 mean[col], std[col] = 0.0, 1.0
                 continue
-            m = float(finite.mean(dtype=np.float64))
-            s = float(finite.std(dtype=np.float64))
-            mean[col] = m
-            std[col] = s if s > 1e-12 else 1.0
+            mean[col], std[col] = self._affine_params(
+                float(finite.sum(dtype=np.float64)),
+                float(np.einsum("i,i->", finite, finite, dtype=np.float64)),
+                float(finite.size),
+                float(finite.min()),
+                float(finite.max()),
+            )
         self._feat_mean, self._feat_std = mean, std
 
     def _set_stats_streaming(
@@ -1265,25 +1373,28 @@ class NSREngine:
         s1 = np.zeros(ncol)
         s2 = np.zeros(ncol)
         cnt = np.zeros(ncol)
+        vmin = np.full(ncol, np.inf)
+        vmax = np.full(ncol, -np.inf)
         for start, stop in chunk_ranges(lo, hi, chunk_rows):
             arrays, _ = store.gather(slice(start, stop))
             for j, c in enumerate(cols):
                 a = arrays[c]
                 fin = a[np.isfinite(a)]
+                if self.scale_mode in _LOG_SCALE_MODES:
+                    self._require_positive(c, fin)
+                    fin = np.log(fin.astype(np.float64))
+                if fin.size == 0:
+                    continue
                 s1[j] += float(fin.sum(dtype=np.float64))
                 s2[j] += float(np.einsum("i,i->", fin, fin, dtype=np.float64))
                 cnt[j] += fin.size
+                vmin[j] = min(vmin[j], float(fin.min()))
+                vmax[j] = max(vmax[j], float(fin.max()))
         mean: dict[str, float] = {}
         std: dict[str, float] = {}
         for j, c in enumerate(cols):
-            if cnt[j] == 0:
-                mean[c], std[c] = 0.0, 1.0
-                continue
-            m = s1[j] / cnt[j]
-            var = max(s2[j] / cnt[j] - m * m, 0.0)
-            s = math.sqrt(var)
-            mean[c] = float(m)
-            std[c] = float(s) if s > 1e-12 else 1.0
+            m, s = self._affine_params(s1[j], s2[j], cnt[j], vmin[j], vmax[j])
+            mean[c], std[c] = float(m), float(s)
         self._feat_mean, self._feat_std = mean, std
 
     def _standardize_arrays(
@@ -1292,17 +1403,29 @@ class NSREngine:
         if not self.standardize or self._feat_mean is None:
             return arrays
         mean, std = self._feat_mean, self._feat_std
+        log_scaled = self.scale_mode in _LOG_SCALE_MODES
         out: dict[str, np.ndarray] = {}
         for col, arr in arrays.items():
-            if col in mean:
-                if inplace:
-                    arr -= mean[col]
-                    arr /= std[col]  # type: ignore[index]
-                    out[col] = arr
-                else:
-                    out[col] = (arr - mean[col]) / std[col]  # type: ignore[index]
-            else:
+            if col not in mean:
                 out[col] = arr
+            elif log_scaled:
+                # Stats were fitted on the train range; rows outside it can still
+                # be non-positive.  Those become NaN and are dropped by the finite
+                # masks downstream rather than aborting the fit.  ``inplace`` does
+                # not apply — the log needs a fresh buffer.
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    vals = np.log(np.where(arr > 0.0, arr, np.nan))
+                vals -= mean[col]
+                vals /= std[col]  # type: ignore[index]
+                if self.scale_mode == "geometric":
+                    np.exp(vals, out=vals)
+                out[col] = vals
+            elif inplace:
+                arr -= mean[col]
+                arr /= std[col]  # type: ignore[index]
+                out[col] = arr
+            else:
+                out[col] = (arr - mean[col]) / std[col]  # type: ignore[index]
         return out
 
     def _score(self, pred: np.ndarray, y: np.ndarray) -> float | None:
@@ -1553,7 +1676,8 @@ class NSREngine:
         print(
             f"[nsr] device={device}  mode=out-of-core  "
             f"train_rows={train_hi - train_lo:,}  step_subsample={step_n:,}  "
-            f"standardize={self.standardize}  affine_reward={self.affine_reward}  "
+            f"standardize={self.standardize}  scale_mode={self.scale_mode}  "
+            f"affine_reward={self.affine_reward}  "
             f"score_metric={self.score_metric}",
             flush=True,
         )
@@ -1562,7 +1686,11 @@ class NSREngine:
         )
 
         if self.standardize:
-            print("[nsr] computing per-feature standardization stats over train range …", flush=True)
+            print(
+                f"[nsr] computing per-feature {self.scale_mode} scaling stats "
+                "over train range …",
+                flush=True,
+            )
             self._set_stats_streaming(store, train_lo, train_hi, chunk_rows)
 
         def sample_step() -> tuple[dict[str, np.ndarray], np.ndarray, float]:
@@ -2139,7 +2267,12 @@ class NSREngine:
             if not math.isfinite(score_val):
                 continue
             converted = _to_sympy_affine(
-                list(cand.tokens), b0, b1, self._feat_mean, self._feat_std
+                list(cand.tokens),
+                b0,
+                b1,
+                self._feat_mean,
+                self._feat_std,
+                feat_mode=self.scale_mode if self.standardize else None,
             )
             if converted is None:
                 continue

@@ -99,7 +99,9 @@ python main.py --unary-ops square,abs,log,sqrt,sin,cos,tanh --metric r2
 | `--const-tokens` | `-1.0,-0.5,0.5,1.0,2.0` | Comma-separated `float(...)`-parseable values | Constant terminal tokens. |
 | `--device` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"`, `"mps"`, or any Torch device string | `"auto"` selects CUDA, then Apple MPS, then CPU. |
 | `--step-subsample-size` | `None` | Positive integer or `none` | Rows used per training reward calculation. `none` uses all rows. |
-| `--standardize` / `--no-standardize` | `True` | Flag | Enable or disable feature z-scoring. |
+| `--standardize` / `--no-standardize` | `True` | Flag | Enable or disable per-column feature scaling. |
+| `--scale-mode` | `zscore` | `zscore`, `scale`, `minmax`, `geometric`, `log`, `none` | How feature columns are scaled. See [Scale mode values](#scale-mode-values). |
+| `--minmax-range` | `0.001,1` | `LO,HI` with `LO < HI` | Target interval of `--scale-mode minmax`. `LO > 0` keeps the column strictly positive. |
 | `--affine-reward` / `--no-affine-reward` | `True` | Flag | Enable or disable least-squares affine scoring. |
 | `--metric`, `--score-metric` | `"mse"` | `"mse"`, `"rmse"`, `"mae"`, `"mape"`, `"mbd"`, `"r2"`, `"adjusted_r2"` | Accuracy metric. See [Score metric values](#score-metric-values). |
 | `--prefilter-per-complexity` | `16` | Any positive integer | Candidates kept per complexity, ranked by exact score, before SymPy conversion. |
@@ -208,6 +210,31 @@ The same menu is available to the Python API through
 | Default | Available options |
 | --- | --- |
 | `-1.0 -0.5 0.5 1.0 2.0` | Any comma-separated values parseable by `float(...)`, e.g. `--const-tokens -2.0,-1.0,1.0,2.0,3.14` |
+
+## Scale mode values
+
+Per-column, fitted on the training rows only, and unwound before the front is
+reported: the returned SymPy formulas are always expressed against the raw
+columns, so the mode never leaks into the printed equation.
+
+The choice matters most on a **strictly positive** dataset. `zscore` centers,
+and `x - mean` is negative for roughly half the rows, so every `log`, `sqrt`
+and fractional `pow` in the library spends those rows in its domain guard
+instead of on signal. The other modes condition the columns without leaving the
+positive orthant.
+
+| Value | Transform | Keeps a positive column positive? | Use when |
+| --- | --- | --- | --- |
+| `zscore` | `(x - mean) / std` | No | The default, and the right one for signed data. |
+| `scale` | `x / rms` | Yes | Positive data. Scale-only: no centering, so row-to-row *ratios* survive and a monomial target `c * a**p * b**q` keeps its exact form, the rescaling being absorbed into `c` by the affine wrapper's slope. Equals `zscore` on a zero-mean column. |
+| `minmax` | affine onto `--minmax-range` | Yes, when `LO > 0` | Positive, bounded, outlier-free columns. It shifts, so ratios and power-law form are distorted, and it is the most outlier-sensitive of the modes. |
+| `geometric` | `(x / GM) ** (1 / std_log)` | Yes | Positive columns spanning several orders of magnitude. The multiplicative analogue of `zscore`: the z-score taken in log space and mapped back, leaving a column with geometric mean 1. |
+| `log` | `(log x - mean_log) / std_log` | No | The same z-score left *in* log space. Best conditioned, but signed — prefer `geometric` while `log` is in the unary library, since one `log` token recovers this column from that one. |
+| `none` | — | — | Equivalent to `--no-standardize`. |
+
+`geometric` and `log` require strictly positive columns and raise otherwise.
+Rows outside the training range that are non-positive become `NaN` and are
+dropped by the usual finite masks rather than aborting the fit.
 
 ## Score metric values
 

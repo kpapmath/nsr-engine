@@ -251,7 +251,9 @@ front = engine.fit_memmap(store, train_lo=0, train_hi=store.n_rows)
 | `max_len` | 15 | Max token sequence length |
 | `elite_frac` | 0.05 | Risk-seeking quantile ε |
 | `entropy_weight` | 0.005 | Entropy bonus coefficient |
-| `standardize` | True | Z-score features before training |
+| `standardize` | True | Scale feature columns before training |
+| `scale_mode` | `"zscore"` | How they are scaled: `"zscore"`, `"scale"`, `"minmax"`, `"geometric"`, or `"log"`. The middle three preserve a strictly positive domain; `"zscore"` centers and so does not. See the [CLI reference](docs/cli_reference.md#scale-mode-values) |
+| `minmax_range` | `(1e-3, 1.0)` | Target interval of `scale_mode="minmax"` |
 | `affine_reward` | True | Score residuals after a least-squares affine fit |
 | `score_metric` | `"mse"` | Accuracy metric: `"mse"`, `"rmse"`, `"mae"`, `"mape"`, `"mbd"`, `"r2"`, or `"adjusted_r2"` |
 | `cache_dir` | None | Cache lambda runs to disk (JSON) |

@@ -36,6 +36,23 @@ def _float_grid(value: str) -> list[float]:
     return [float(part.strip()) for part in value.split(",") if part.strip()]
 
 
+def _minmax_range(value: str) -> tuple[float, float]:
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"invalid minmax range: {value}. Use LO,HI (e.g. 0.001,1)."
+        )
+    try:
+        lo, hi = float(parts[0]), float(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid minmax range: {value}. Both bounds must be numbers."
+        ) from None
+    if not lo < hi:
+        raise argparse.ArgumentTypeError(f"invalid minmax range: {value}. Need LO < HI.")
+    return lo, hi
+
+
 def _none_or_int(value: str) -> int | None:
     if value.lower() in {"none", "null"}:
         return None
@@ -185,8 +202,32 @@ def parse_args() -> argparse.Namespace:
         engine,
         "standardize",
         default=True,
-        help_text="Z-score feature columns before training.",
-        disable_help_text="Do not z-score feature columns before training.",
+        help_text="Scale feature columns before training (see --scale-mode).",
+        disable_help_text="Do not scale feature columns before training.",
+    )
+    engine.add_argument(
+        "--scale-mode",
+        choices=("zscore", "scale", "minmax", "geometric", "log", "none"),
+        default="zscore",
+        help=(
+            "How feature columns are scaled. 'zscore' is (x-mean)/std, which "
+            "centers and so does not preserve a positive-only domain. Three "
+            "modes do preserve it: 'scale' divides by the RMS without centering "
+            "(row-to-row ratios and power-law form survive), 'minmax' maps onto "
+            "--minmax-range, and 'geometric' is (x/GM)**(1/std_log) -- the "
+            "z-score taken in log space and mapped back -- for columns spanning "
+            "several orders of magnitude. 'log' is that same z-score left in log "
+            "space: best conditioned, but signed. 'geometric' and 'log' need "
+            "strictly positive columns. 'none' is equivalent to --no-standardize."
+        ),
+    )
+    engine.add_argument(
+        "--minmax-range",
+        type=_minmax_range,
+        default=(1e-3, 1.0),
+        metavar="LO,HI",
+        help="Target interval of --scale-mode minmax. LO > 0 keeps the scaled "
+        "column strictly positive. Default: 0.001,1.",
     )
     _add_bool_arg(
         engine,
@@ -376,7 +417,9 @@ def _build_engine(args: argparse.Namespace, *, cache_prefix: str | None = None) 
         const_tokens=args.const_tokens,
         device=args.device,
         step_subsample_size=args.step_subsample_size,
-        standardize=args.standardize,
+        standardize=args.standardize and args.scale_mode != "none",
+        scale_mode="zscore" if args.scale_mode == "none" else args.scale_mode,
+        minmax_range=args.minmax_range,
         affine_reward=args.affine_reward,
         count_affine_wrapper=args.count_affine_wrapper,
         score_metric=args.score_metric,
