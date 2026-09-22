@@ -401,6 +401,73 @@ class _EmptyFrontEngine:
         return ParetoFront([])
 
 
+def test_residual_metric_accepts_every_engine_score_metric_but_mbd():
+    """`residual_metric` must be able to follow `score_metric`."""
+    from nsr_engine.boosting import _RESIDUAL_METRICS, ResidualBoostedNSR
+    from nsr_engine.engine import _SCORE_METRICS
+
+    assert set(_RESIDUAL_METRICS) == set(_SCORE_METRICS) - {"mbd"}
+    for metric in _RESIDUAL_METRICS:
+        booster = ResidualBoostedNSR(lambda k: None, residual_metric=metric)
+        assert booster.residual_metric == metric
+
+
+def test_residual_metric_rejects_mbd_with_a_reason():
+    """The one metric that cannot drive the gain rule fails loudly."""
+    from nsr_engine.boosting import ResidualBoostedNSR
+
+    with pytest.raises(ValueError, match="cannot drive the round acceptance rule"):
+        ResidualBoostedNSR(lambda k: None, residual_metric="mbd")
+
+
+def test_boosted_front_is_scored_in_the_engines_metric():
+    """`boosting=True` under a non-MSE metric reports that metric, not MSE.
+
+    Before, anything outside mse/rmse fell back to MSE rounds and the round-1
+    front was withheld from the merge, so the caller got a one-point front
+    scored in a metric they never asked for.
+    """
+    X, y = _make_data(n=200)
+    engine = NSREngine(
+        n_lambda=2,
+        n_iters=8,
+        batch_size=16,
+        max_len=7,
+        random_state=0,
+        score_metric="mape",
+        boosting=True,
+        boosting_max_rounds=3,
+        device="cpu",
+    )
+    front = engine.fit(X, y)
+
+    assert len(front) >= 1
+    assert {p.score_metric for p in front.points} == {"mape"}
+
+
+def test_r2_and_mse_gain_rules_agree():
+    """`1 - r2` is proportional to MSE, so the two must accept the same rounds.
+
+    This is the property that lets `r2` drive a *relative* gain threshold at
+    all, so it is worth pinning rather than assuming.
+    """
+    from nsr_engine.boosting import ResidualBoostedNSR
+
+    rng = np.random.default_rng(0)
+    y = rng.standard_normal(200)
+    resid_before = y - 0.3 * y
+    resid_after = y - 0.9 * y
+
+    gains = {}
+    for metric in ("mse", "r2"):
+        booster = ResidualBoostedNSR(lambda k: None, residual_metric=metric)
+        before = booster._loss_of(booster._score_of(resid_before, y, 1))
+        after = booster._loss_of(booster._score_of(resid_after, y, 1))
+        gains[metric] = (before - after) / before
+
+    assert gains["mse"] == pytest.approx(gains["r2"], rel=1e-9)
+
+
 def test_pareto_front_to_frame_uses_metric_column():
     from nsr_engine.pareto import ParetoPoint
 

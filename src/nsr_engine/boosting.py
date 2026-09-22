@@ -29,12 +29,25 @@ import numpy as np
 import pandas as pd
 
 from nsr_engine._expr import eval_sympy_on, mse_of
+from nsr_engine.engine import _metric_from_residuals, _metric_to_loss
 from nsr_engine.pareto import ParetoFront, ParetoPoint
 
 __all__ = ["ResidualBoostedNSR"]
 
 _TERM_SELECTIONS = ("elbow", "min_mse")
-_RESIDUAL_METRICS = ("mse", "rmse")
+
+# Every ``NSREngine.score_metric`` except ``"mbd"``.  See the ``residual_metric``
+# docstring for why that one is excluded rather than supported.
+_RESIDUAL_METRICS = ("mse", "rmse", "mae", "mape", "r2", "adjusted_r2")
+
+# Rejected with an explanation rather than silently mixed into the gain rule.
+_UNSUPPORTED_RESIDUAL_METRICS = {
+    "mbd": (
+        "mbd measures signed bias, which the affine reward's intercept already "
+        "drives to ~0 in round 1; the gain rule would then divide by ~0 and "
+        "accept arbitrary later rounds"
+    ),
+}
 
 
 class ResidualBoostedNSR:
@@ -64,14 +77,46 @@ class ResidualBoostedNSR:
         accurate point of the round's front, recovering more per round when
         parsimony is not the priority.
     residual_metric:
-        Objective the round-acceptance rule is measured in, ``"mse"`` (default,
-        the historical behaviour) or ``"rmse"``.  It sets what ``min_gain`` is a
-        fraction *of* and what the emitted points report as their score, so a
-        caller running the weak learner under ``score_metric="rmse"`` can make
-        the booster agree with it instead of mixing the two.
+        Objective the round-acceptance rule is measured in: ``"mse"`` (default,
+        the historical behaviour), ``"rmse"``, ``"mae"``, ``"mape"``, ``"r2"``
+        or ``"adjusted_r2"``.  It sets what ``min_gain`` is a fraction *of* and
+        what the emitted points report as their score, so a caller running the
+        weak learner under a given ``score_metric`` can make the booster agree
+        with it instead of mixing the two.
 
-        The two are monotonically related, so they never disagree about which
-        round is *better* -- only about how large the improvement looks:
+        New in 0.8.1.  Before, only ``"mse"`` and ``"rmse"`` were accepted, so
+        any other ``score_metric`` left the weak learner optimising one
+        objective while the acceptance rule measured another.  The list is now
+        every ``NSREngine.score_metric`` but one, and the values are computed by
+        the engine's own metric code, so the two cannot disagree about what a
+        metric *means*.
+
+        ``"mbd"`` is rejected rather than supported.  It measures signed bias,
+        which the affine reward's intercept already drives to ~0 in round 1;
+        the relative gain rule would then be dividing by ~0 and would accept
+        essentially any later round.  It is a diagnostic, not an objective, so
+        asking for it raises rather than silently falling back to MSE.
+
+        Two design points, since ``mape`` and ``r2`` are defined against the
+        *target* rather than a residual vector:
+
+        * The rule scores the cumulative model against the original ``y``, not
+          the round's residual, so the target is in hand and both are
+          well-defined.  Rows on which the model is undefined are dropped from
+          the residual and the target together, matching how the engine scores
+          a candidate on its finite subset.
+        * ``min_gain`` is applied to the metric's *loss* form -- the metric
+          itself for the error metrics, and ``1 - r2`` for ``"r2"`` and
+          ``"adjusted_r2"``, which are maximised and may be negative.  A
+          relative threshold needs a non-negative quantity that falls as the
+          model improves; the raw ``r2`` is neither.  Because ``1 - r2`` is
+          proportional to MSE for a fixed target, gains under ``"r2"`` equal
+          gains under ``"mse"`` exactly, while the front still reports ``r2``.
+          ``"adjusted_r2"`` additionally charges the model its term count, so a
+          round must beat the parameter penalty it adds.
+
+        Metrics are monotonically related in pairs but not equally scaled, so
+        the *same* ``min_gain`` means different things under each:
         ``gain_rmse = 1 - sqrt(1 - gain_mse)``.  A ``min_gain`` of 0.02 in MSE
         is 0.01 in RMSE; passing the same number under both metrics tightens
         the threshold rather than preserving it.
@@ -101,6 +146,13 @@ class ResidualBoostedNSR:
             supported = ", ".join(repr(s) for s in _TERM_SELECTIONS)
             raise ValueError(f"term_selection must be one of: {supported}")
         residual_metric = residual_metric.lower()
+        if residual_metric in _UNSUPPORTED_RESIDUAL_METRICS:
+            why = _UNSUPPORTED_RESIDUAL_METRICS[residual_metric]
+            supported = ", ".join(repr(s) for s in _RESIDUAL_METRICS)
+            raise ValueError(
+                f"residual_metric={residual_metric!r} cannot drive the round "
+                f"acceptance rule: {why}. Supported: {supported}."
+            )
         if residual_metric not in _RESIDUAL_METRICS:
             supported = ", ".join(repr(s) for s in _RESIDUAL_METRICS)
             raise ValueError(f"residual_metric must be one of: {supported}")
@@ -113,16 +165,50 @@ class ResidualBoostedNSR:
         self.rounds_: list[dict[str, Any]] = []
         self.terms_: list[tuple[Any, int]] = []
 
-    def _score_of(self, residual: np.ndarray) -> float:
+    def _score_of(
+        self,
+        residual: np.ndarray,
+        y: np.ndarray,
+        n_terms: int,
+    ) -> float:
         """Residual objective, in whichever metric ``residual_metric`` names.
 
-        ``mse_of`` ignores non-finite entries, so rows where the model is
-        undefined drop out of the score exactly as they do in the engine.
+        Delegates to the engine's own ``_metric_from_residuals`` so the booster
+        and its weak learner compute a given metric identically -- the whole
+        point of letting ``residual_metric`` follow ``score_metric``.
+
+        Rows where the model is undefined are dropped before scoring, mirroring
+        the engine, which scores each candidate on its finite subset.  ``y`` is
+        masked alongside the residual because ``mape`` and ``r2`` are defined
+        against the target, not the residual alone.
+
+        ``n_terms`` is the number of additive terms in the model being scored;
+        it is the parameter count ``adjusted_r2`` penalises.
         """
-        value = mse_of(residual)
-        if self.residual_metric == "rmse":
-            return float(np.sqrt(value))
-        return value
+        residual = np.asarray(residual, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        mask = np.isfinite(residual) & np.isfinite(y)
+        if int(mask.sum()) < 2:
+            return float("nan")
+        return _metric_from_residuals(
+            residual[mask],
+            self.residual_metric,
+            y=y[mask],
+            n_params=max(1, n_terms),
+        )
+
+    def _loss_of(self, score: float) -> float:
+        """The round-acceptance rule's positive loss for a metric value.
+
+        ``min_gain`` is a *relative* threshold, so it needs a quantity that is
+        non-negative and decreases as the model improves.  The error metrics
+        already are one; ``r2``/``adjusted_r2`` are maximised, so the engine's
+        ``_metric_to_loss`` maps them to ``1 - r2`` -- the unexplained variance
+        fraction, which for a fixed target is proportional to MSE.  Gains under
+        ``r2`` therefore equal gains under ``mse`` exactly, while the points the
+        front reports stay in ``r2``.
+        """
+        return _metric_to_loss(score, self.residual_metric)
 
     def _pick_term(self, front: ParetoFront) -> ParetoPoint | None:
         """Best MSE-drop-per-complexity term of the round's front."""
@@ -162,7 +248,9 @@ class ResidualBoostedNSR:
                         "gain": 0.0,
                         "term": None,
                         "cum_mse": mse_of(residual),
-                        "cum_score": self._score_of(residual),
+                        "cum_score": self._score_of(
+                            residual, y_arr, len(self.terms_)
+                        ),
                     }
                 )
                 break
@@ -187,18 +275,28 @@ class ResidualBoostedNSR:
                         "gain": 0.0,
                         "term": expr,
                         "cum_mse": mse_of(residual),
-                        "cum_score": self._score_of(residual),
+                        "cum_score": self._score_of(
+                            residual, y_arr, len(self.terms_)
+                        ),
                     }
                 )
                 break
 
-            prev_score = self._score_of(residual)
+            prev_score = self._score_of(residual, y_arr, len(self.terms_))
             new_pred = model_pred + pred
             new_resid = y_arr - new_pred
-            new_score = self._score_of(new_resid)
+            new_score = self._score_of(new_resid, y_arr, len(self.terms_) + 1)
+
+            # `min_gain` is relative, so it is measured on the metric's loss
+            # form, never on the metric itself: under `r2` the raw value grows
+            # towards 1 and can be negative, which would invert the rule's sign.
+            # For every error metric the loss *is* the metric, so `mse`/`rmse`
+            # keep their historical arithmetic exactly.
+            prev_loss = self._loss_of(prev_score)
+            new_loss = self._loss_of(new_score)
             gain = (
-                (prev_score - new_score) / prev_score
-                if np.isfinite(prev_score) and prev_score > 0.0
+                (prev_loss - new_loss) / prev_loss
+                if np.isfinite(prev_loss) and prev_loss > 0.0
                 else 0.0
             )
 

@@ -1549,14 +1549,15 @@ class NSREngine:
 
     def _fit_boosted(self, X: pd.DataFrame, y: pd.Series) -> ParetoFront:
         """Greedy additive boosting over fresh per-round engines (layer 1)."""
-        from nsr_engine.boosting import ResidualBoostedNSR
+        from nsr_engine.boosting import _RESIDUAL_METRICS, ResidualBoostedNSR
 
-        # The booster measures rounds in MSE or RMSE only.  Where the engine's
-        # own metric is one of those, using it keeps a single metric across the
-        # whole front; under any other metric the rounds are scored in MSE, and
-        # a front mixing the two would be meaningless — so the round-1 front is
+        # The booster measures rounds in the engine's own metric wherever it can
+        # drive the acceptance rule, which as of 0.8.1 is every score metric but
+        # `mbd`.  That keeps a single metric across the whole front.  Under a
+        # metric the booster cannot use, the rounds are scored in MSE and a
+        # front mixing the two would be meaningless — so the round-1 front is
         # not merged in that case.
-        metrics_agree = self.score_metric in ("mse", "rmse")
+        metrics_agree = self.score_metric in _RESIDUAL_METRICS
         round_fronts: list[ParetoFront] = []
 
         booster = ResidualBoostedNSR(

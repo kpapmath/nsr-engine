@@ -687,7 +687,28 @@ def test_residual_metric_defaults_to_mse():
 
 def test_invalid_residual_metric_is_rejected():
     with pytest.raises(ValueError, match="residual_metric"):
-        ResidualBoostedNSR(_two_term_factory, residual_metric="mape")
+        ResidualBoostedNSR(_two_term_factory, residual_metric="not_a_metric")
+
+
+def test_mbd_residual_metric_is_rejected_with_a_reason():
+    """`mbd` is the one score metric the gain rule cannot use.
+
+    It was rejected before only because everything but mse/rmse was; now that
+    the rest are supported it is refused on its own merits, so the message has
+    to say why rather than just listing alternatives.
+    """
+    with pytest.raises(ValueError, match="cannot drive the round acceptance rule"):
+        ResidualBoostedNSR(_two_term_factory, residual_metric="mbd")
+
+
+def test_mape_residual_metric_labels_and_scores_in_mape():
+    """`mape` now follows `score_metric` instead of being refused outright."""
+    X, y = _make_data()
+    front = ResidualBoostedNSR(_two_term_factory, residual_metric="mape").fit(X, y)
+
+    assert len(front) >= 1
+    assert {p.score_metric for p in front.points} == {"mape"}
+    assert all(p.mse >= 0.0 for p in front.points)
 
 
 def test_rmse_residual_metric_labels_and_scores_in_rmse():
