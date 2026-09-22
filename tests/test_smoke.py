@@ -294,8 +294,11 @@ def _tiny_engine(**kwargs) -> NSREngine:
     return NSREngine(**params)
 
 
-def test_fit_saves_the_front_by_default(tmp_path):
+def test_fit_saves_the_front_by_default(tmp_path, monkeypatch):
     """The search costs minutes to hours; its result must outlive the process."""
+    # `front_dir` defaults to a *working directory*-relative path, so the test
+    # sets the working directory rather than trusting the one it inherits.
+    monkeypatch.chdir(tmp_path)
     X, y = _make_data()
     engine = _tiny_engine()
 
@@ -310,7 +313,8 @@ def test_fit_saves_the_front_by_default(tmp_path):
     assert len(frame) == len(front)
 
 
-def test_no_save_front_leaves_the_filesystem_alone(tmp_path):
+def test_no_save_front_leaves_the_filesystem_alone(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     X, y = _make_data()
     engine = _tiny_engine(save_front=False)
 
@@ -320,7 +324,8 @@ def test_no_save_front_leaves_the_filesystem_alone(tmp_path):
     assert engine.front_path_ is None
 
 
-def test_front_dir_redirects_the_file(tmp_path):
+def test_front_dir_redirects_the_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     X, y = _make_data()
     engine = _tiny_engine(front_dir=tmp_path / "somewhere" / "else")
 
@@ -344,7 +349,8 @@ def test_a_failed_save_does_not_fail_the_fit(tmp_path, capsys):
     assert "could not save" in capsys.readouterr().out
 
 
-def test_saving_never_overwrites_an_earlier_front(tmp_path):
+def test_saving_never_overwrites_an_earlier_front(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     X, y = _make_data()
     engine = _tiny_engine()
 
@@ -355,8 +361,9 @@ def test_saving_never_overwrites_an_earlier_front(tmp_path):
     assert first.exists() and second.exists()
 
 
-def test_boosting_saves_one_file_not_one_per_round(tmp_path):
+def test_boosting_saves_one_file_not_one_per_round(tmp_path, monkeypatch):
     """Round fronts are merged into the saved front; they are not files."""
+    monkeypatch.chdir(tmp_path)
     X, y = _make_data()
     engine = _tiny_engine(boosting=True, boosting_max_rounds=2, n_lambda=1, n_iters=3)
 
