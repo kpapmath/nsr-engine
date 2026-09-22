@@ -984,7 +984,7 @@ class NSREngine:
         Master switch for per-column feature scaling.  ``False`` trains on the
         raw columns and ``scale_mode`` is then irrelevant.
     scale_mode:
-        *How* the columns are scaled when ``standardize=True``.  Stats are
+        New in 0.8.0.  *How* the columns are scaled when ``standardize=True``.  Stats are
         fitted on the training rows only and the returned SymPy formulas are
         converted back to raw feature terms, so the choice never leaks into the
         reported equation.

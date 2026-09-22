@@ -213,7 +213,7 @@ The same menu is available to the Python API through
 
 ## Scale mode values
 
-Per-column, fitted on the training rows only, and unwound before the front is
+New in 0.8.0. Per-column, fitted on the training rows only, and unwound before the front is
 reported: the returned SymPy formulas are always expressed against the raw
 columns, so the mode never leaks into the printed equation.
 
