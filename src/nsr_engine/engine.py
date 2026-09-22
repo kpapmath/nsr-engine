@@ -56,9 +56,11 @@ import copy
 import heapq
 import json
 import math
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 import numpy as np
 import pandas as pd
@@ -474,6 +476,70 @@ def _target_metric_scale(y: np.ndarray, metric: str) -> float:
 # completing, only cap the ones that were not.
 _SIMPLIFY_TIMEOUT_S = 5.0
 
+# Wall-clock bound on *building* a candidate's sympy expression, in seconds.
+# Overridable with NSR_CONVERT_TIMEOUT_S.
+#
+# Construction is not the cheap half of conversion it looks like.  SymPy
+# evaluates as it builds, and for a nested unary chain that evaluation is
+# exponential in the nesting depth: measured on `tanh` over three scaled
+# features, one extra level costs ~3.5x, running 0.4 s at depth 3, 5 s at
+# depth 5 and 19 s at depth 6 -- before `simplify` is even reached.  A
+# 15-token expression can nest ten deep, and the policy does sample those.
+#
+# This is independent of `scale_mode`; centring merely adds a constant factor
+# (~2.5x for "log", ~2.2x for the default "zscore") on top of the same curve.
+#
+# `_SIMPLIFY_TIMEOUT_S` does not cover any of it: that bound starts after the
+# expression exists.  A candidate that blows this budget is dropped, which is
+# the same treatment the engine already gives one that fails to convert.
+_CONVERT_TIMEOUT_S = 10.0
+
+
+def _budget_seconds(env_var: str, default: float) -> float:
+    try:
+        return float(os.environ.get(env_var, default))
+    except ValueError:
+        return default
+
+
+@contextmanager
+def _time_budget(limit: float) -> "Iterator[bool]":
+    """Run the block under a wall-clock bound, yielding whether it is enforced.
+
+    Yields ``True`` when the bound is active, so a caller can tell a genuine
+    completion from one that was never bounded in the first place.
+
+    The bound uses ``SIGALRM``, which is only available on POSIX and only from
+    the main thread.  Where it is not, the block runs unbounded rather than
+    silently doing something different; the benchmark harness runs each fit in
+    its own process's main thread, so it is bounded there.
+
+    Callers never nest these -- the phases they guard run in sequence -- so a
+    single interval timer is enough and no deadline stack is needed.
+    """
+    import signal
+
+    if limit <= 0 or not hasattr(signal, "SIGALRM"):
+        yield False
+        return
+
+    def _raise(signum, frame):  # noqa: ANN001
+        raise TimeoutError("exceeded its budget")
+
+    try:
+        previous = signal.signal(signal.SIGALRM, _raise)
+    except ValueError:
+        # Not the main thread: signals are unavailable here.
+        yield False
+        return
+
+    try:
+        signal.setitimer(signal.ITIMER_REAL, limit)
+        yield True
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+
 
 def _bounded_simplify(expr: Any) -> Any:
     """``sympy.simplify(expr)``, or the expression unchanged if it takes too long.
@@ -482,41 +548,18 @@ def _bounded_simplify(expr: Any) -> Any:
     when ``simplify`` raises -- an unsimplified expression is mathematically
     identical and merely reads less tidily.
 
-    The bound uses ``SIGALRM``, which is only available on POSIX and only from
-    the main thread.  Where it is not, the call runs unbounded rather than
-    silently doing something different; the benchmark harness runs each fit in
-    its own process's main thread, so it is bounded there.
+    The bound covers ``simplify`` only -- by the time it is called the
+    expression already exists, so it does nothing about the cost of *building*
+    one.  ``_CONVERT_TIMEOUT_S`` bounds that phase separately.
     """
-    import os
-    import signal
-
     import sympy as sp
 
+    limit = _budget_seconds("NSR_SIMPLIFY_TIMEOUT_S", _SIMPLIFY_TIMEOUT_S)
     try:
-        limit = float(os.environ.get("NSR_SIMPLIFY_TIMEOUT_S", _SIMPLIFY_TIMEOUT_S))
-    except ValueError:
-        limit = _SIMPLIFY_TIMEOUT_S
-
-    if limit <= 0 or not hasattr(signal, "SIGALRM"):
-        return sp.simplify(expr)
-
-    def _raise(signum, frame):  # noqa: ANN001
-        raise TimeoutError("simplify exceeded its budget")
-
-    try:
-        previous = signal.signal(signal.SIGALRM, _raise)
-    except ValueError:
-        # Not the main thread: signals are unavailable here.
-        return sp.simplify(expr)
-
-    try:
-        signal.setitimer(signal.ITIMER_REAL, limit)
-        return sp.simplify(expr)
+        with _time_budget(limit):
+            return sp.simplify(expr)
     except TimeoutError:
         return expr
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, previous)
 
 
 def _to_sympy_affine(
@@ -577,16 +620,36 @@ def _to_sympy_affine(
             return sp.exp(scaled) if feat_mode == "geometric" else scaled
         return sym
 
-    expr = _rec()
-    if expr is None:
+    # Building the expression is where a pathological candidate actually burns
+    # its time -- sympy evaluates as it constructs, exponentially in unary
+    # nesting depth -- so the build gets its own bound.  Returning None on
+    # timeout drops the candidate, which `_assemble_front` already handles: it
+    # is the same outcome as a candidate that fails to convert at all.
+    limit = _budget_seconds("NSR_CONVERT_TIMEOUT_S", _CONVERT_TIMEOUT_S)
+    try:
+        with _time_budget(limit):
+            expr = _rec()
+            if expr is None:
+                return None
+            final = sp.Float(b0) + sp.Float(b1) * expr
+    except TimeoutError:
+        print(
+            f"[nsr] warning: skipped candidate whose sympy conversion exceeded "
+            f"{limit:g}s: {' '.join(tokens)}",
+            flush=True,
+        )
         return None
-    final = sp.Float(b0) + sp.Float(b1) * expr
+
     try:
         simplified = _bounded_simplify(final)
-        eq_str = str(simplified)
     except Exception:
         simplified = final
-        eq_str = str(final)
+    # `str` walks the expression too, so it is bounded on the same grounds.
+    try:
+        with _time_budget(limit):
+            eq_str = str(simplified)
+    except Exception:
+        return None
     return eq_str, simplified
 
 
@@ -627,15 +690,24 @@ def _to_sympy(tokens: list[str]) -> tuple[str, Any] | None:
 
         return sp.Symbol(tok)
 
-    expr = _rec()
+    limit = _budget_seconds("NSR_CONVERT_TIMEOUT_S", _CONVERT_TIMEOUT_S)
+    try:
+        with _time_budget(limit):
+            expr = _rec()
+    except TimeoutError:
+        return None
     if expr is None:
         return None
+
     try:
         simplified = _bounded_simplify(expr)
-        eq_str = str(simplified)
     except Exception:
-        eq_str = str(expr)
         simplified = expr
+    try:
+        with _time_budget(limit):
+            eq_str = str(simplified)
+    except Exception:
+        return None
 
     return eq_str, simplified
 

@@ -307,6 +307,60 @@ def test_pareto_front_elbow():
     assert elbow.equation == "b"
 
 
+# Token sequence that stalled a real `scale_mode="log"` fit (seed 7) for 6h40m:
+# ten nested `tanh`, whose *construction* cost sympy 54 s before `simplify` --
+# the phase the old `_SIMPLIFY_TIMEOUT_S` never covered.
+_NESTED_TANH_TOKENS = [
+    "tanh", "tanh", "tanh", "tanh", "tanh", "tanh",
+    "-", "tanh", "tanh", "tanh", "tanh", "l",
+    "-", "delta", "p",
+]
+_LOG_MEAN = {"p": -0.90, "l": -0.30, "delta": 2.60}
+_LOG_STD = {"p": 0.75, "l": 1.10, "delta": 1.90}
+
+
+def test_sympy_conversion_bounds_nested_unary_build(monkeypatch):
+    """A candidate whose sympy *build* runs away is dropped, not waited on."""
+    import time
+
+    from nsr_engine import engine
+
+    monkeypatch.setattr(engine, "_CONVERT_TIMEOUT_S", 0.5)
+    start = time.monotonic()
+    converted = engine._to_sympy_affine(
+        _NESTED_TANH_TOKENS, 0.5, 1.2, _LOG_MEAN, _LOG_STD, feat_mode="log"
+    )
+    elapsed = time.monotonic() - start
+
+    assert converted is None, "runaway build must be skipped, not returned"
+    # Unbounded this takes ~54s; the budget is 0.5s. A generous ceiling keeps
+    # the test from flaking on a loaded machine while still failing loudly if
+    # the bound is removed.
+    assert elapsed < 10.0, f"build was not bounded: took {elapsed:.1f}s"
+
+
+def test_sympy_conversion_still_converts_benign_candidate(monkeypatch):
+    """The build bound must not cost ordinary candidates their conversion."""
+    from nsr_engine import engine
+
+    monkeypatch.setattr(engine, "_CONVERT_TIMEOUT_S", 0.5)
+    converted = engine._to_sympy_affine(
+        ["+", "p", "l"], 0.0, 1.0, _LOG_MEAN, _LOG_STD, feat_mode="log"
+    )
+
+    assert converted is not None
+    eq_str, expr = converted
+    assert "log" in eq_str
+
+
+def test_time_budget_runs_unbounded_when_disabled():
+    """A non-positive limit means "no bound", and says so via the yielded flag."""
+    from nsr_engine.engine import _time_budget
+
+    with _time_budget(0.0) as bounded:
+        assert bounded is False
+
+
 def test_pareto_front_elbow_empty_raises():
     with pytest.raises(ValueError, match="empty Pareto front"):
         ParetoFront([]).elbow()
