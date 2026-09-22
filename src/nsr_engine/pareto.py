@@ -77,7 +77,7 @@ class ParetoFront:
     points:
         The front's points.
     empty_reason:
-        New in 0.8.1.  Optional diagnostic explaining *why* a front came back
+        New in 0.9.0.  Optional diagnostic explaining *why* a front came back
         empty, quoted by :meth:`elbow` so the caller reads the cause rather
         than a bare "no candidate was accepted".  Producers that know the
         reason -- :class:`~nsr_engine.boosting.ResidualBoostedNSR` records the
@@ -181,7 +181,7 @@ class ParetoFront:
     ) -> Path:
         """Write the whole front to ``path`` as CSV and return that path.
 
-        New in 0.8.1.  ``to_frame`` carries the three fields dominance is
+        New in 0.9.0.  ``to_frame`` carries the three fields dominance is
         decided on; this carries what a reader needs *afterwards* -- which
         point :meth:`elbow` picks, and, when the data the front was fitted on
         is passed as ``X``/``y``, each point's RMSE and R2 on it.  Those two
@@ -211,7 +211,7 @@ class ParetoFront:
         X: pd.DataFrame | None = None,
         y: "pd.Series | Any" = None,
     ) -> pd.DataFrame:
-        """The frame :meth:`save` writes.  New in 0.8.1."""
+        """The frame :meth:`save` writes.  New in 0.9.0."""
         import numpy as np
 
         elbow_eq: str | None = None

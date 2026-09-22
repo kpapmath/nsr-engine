@@ -84,7 +84,7 @@ class ResidualBoostedNSR:
         weak learner under a given ``score_metric`` can make the booster agree
         with it instead of mixing the two.
 
-        New in 0.8.1.  Before, only ``"mse"`` and ``"rmse"`` were accepted, so
+        New in 0.9.0.  Before, only ``"mse"`` and ``"rmse"`` were accepted, so
         any other ``score_metric`` left the weak learner optimising one
         objective while the acceptance rule measured another.  The list is now
         every ``NSREngine.score_metric`` but one, and the values are computed by

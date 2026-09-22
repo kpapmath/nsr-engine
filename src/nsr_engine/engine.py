@@ -1053,11 +1053,11 @@ class NSREngine:
         Directory for caching discovered candidates (JSON per lambda).
         If ``None``, no cache is written.
     save_front:
-        New in 0.8.1.  Write the front ``fit`` returns to ``front_dir`` as a
+        New in 0.9.0.  Write the front ``fit`` returns to ``front_dir`` as a
         CSV, one file per fit, named
         ``[<cache_prefix>-]front-<timestamp>-seed<random_state>.csv``.  **On by
         default**: a front is the result of a search that costs minutes to
-        hours, and until 0.8.1 it existed only as the returned object, so a
+        hours, and until 0.9.0 it existed only as the returned object, so a
         session that ended without saving it had to search again.  An existing
         file is never overwritten -- a name already taken gets ``-2``, ``-3``
         and so on.  Writing is best-effort: a failure (read-only directory, no
@@ -1067,7 +1067,7 @@ class NSREngine:
         columns; ``fit`` passes the fitted ``X``/``y``, so ``fit_rmse`` and
         ``fit_r2`` are filled in.
     front_dir:
-        New in 0.8.1.  Where ``save_front`` writes, created on demand.
+        New in 0.9.0.  Where ``save_front`` writes, created on demand.
         Relative paths resolve against the working directory; the default is
         ``nsr_pareto_front``.  Ignored when ``save_front=False``.
     standardize:
@@ -1579,7 +1579,7 @@ class NSREngine:
         from nsr_engine.boosting import _RESIDUAL_METRICS, ResidualBoostedNSR
 
         # The booster measures rounds in the engine's own metric wherever it can
-        # drive the acceptance rule, which as of 0.8.1 is every score metric but
+        # drive the acceptance rule, which as of 0.9.0 is every score metric but
         # `mbd`.  That keeps a single metric across the whole front.  Under a
         # metric the booster cannot use, the rounds are scored in MSE and a
         # front mixing the two would be meaningless — so the round-1 front is
