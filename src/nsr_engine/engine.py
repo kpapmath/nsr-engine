@@ -57,6 +57,7 @@ import heapq
 import json
 import math
 import os
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -551,6 +552,10 @@ def _bounded_simplify(expr: Any) -> Any:
     The bound covers ``simplify`` only -- by the time it is called the
     expression already exists, so it does nothing about the cost of *building*
     one.  ``_CONVERT_TIMEOUT_S`` bounds that phase separately.
+
+    ``RecursionError`` is treated as a timeout is: ``simplify`` walks the tree
+    recursively, so a deep enough expression exhausts the stack instead of the
+    clock.  Since 0.9.1.
     """
     import sympy as sp
 
@@ -558,8 +563,40 @@ def _bounded_simplify(expr: Any) -> Any:
     try:
         with _time_budget(limit):
             return sp.simplify(expr)
-    except TimeoutError:
+    except (TimeoutError, RecursionError):
         return expr
+
+
+# The *other* way a candidate is too big to convert is depth, and no wall-clock
+# bound catches it: `SIGALRM` cannot interrupt a stack overflow.  Conversion
+# walks the prefix sequence recursively and sympy's constructors then walk the
+# operands they are handed (assumption queries, `free_symbols`), so the frames
+# a candidate costs grow with its nesting depth -- measured at ~4-5 frames per
+# level for a `sqrt`/`sign` chain under scaled features, which overruns the
+# default 1000-frame limit somewhere past 300 levels of nesting.  `max_len` has
+# no documented ceiling, so a caller can ask for that.
+#
+# A too-deep candidate is dropped exactly like a too-slow one.  The limit is
+# deliberately left where the interpreter puts it: raising it only moves the
+# failure from a `RecursionError` this module can catch to a C-stack overflow
+# that kills the process, and the fit loses nothing by skipping one candidate
+# out of a pool of thousands.
+def _warn_convert_skipped(tokens: list[str], exc: BaseException, limit: float) -> None:
+    """Report a candidate dropped during sympy conversion, and why."""
+    if isinstance(exc, RecursionError):
+        why = (
+            f"nested deeper than the interpreter's recursion limit "
+            f"({sys.getrecursionlimit()} frames)"
+        )
+    elif isinstance(exc, TimeoutError):
+        why = f"exceeded {limit:g}s"
+    else:
+        why = f"raised {type(exc).__name__}"
+    print(
+        f"[nsr] warning: skipped candidate whose sympy conversion {why}: "
+        f"{' '.join(tokens)}",
+        flush=True,
+    )
 
 
 def _to_sympy_affine(
@@ -625,6 +662,12 @@ def _to_sympy_affine(
     # nesting depth -- so the build gets its own bound.  Returning None on
     # timeout drops the candidate, which `_assemble_front` already handles: it
     # is the same outcome as a candidate that fails to convert at all.
+    #
+    # `RecursionError` gets the identical treatment (since 0.9.1): `_rec` and
+    # sympy's constructors below it recurse with the candidate's nesting depth,
+    # which `_time_budget` cannot bound -- SIGALRM is delivered between
+    # bytecodes, and a stack overflow is not a slow loop.  Letting it escape
+    # would fail the whole fit over one candidate, 40 minutes in.
     limit = _budget_seconds("NSR_CONVERT_TIMEOUT_S", _CONVERT_TIMEOUT_S)
     try:
         with _time_budget(limit):
@@ -632,23 +675,22 @@ def _to_sympy_affine(
             if expr is None:
                 return None
             final = sp.Float(b0) + sp.Float(b1) * expr
-    except TimeoutError:
-        print(
-            f"[nsr] warning: skipped candidate whose sympy conversion exceeded "
-            f"{limit:g}s: {' '.join(tokens)}",
-            flush=True,
-        )
+    except (TimeoutError, RecursionError) as exc:
+        _warn_convert_skipped(tokens, exc, limit)
         return None
 
     try:
         simplified = _bounded_simplify(final)
     except Exception:
         simplified = final
-    # `str` walks the expression too, so it is bounded on the same grounds.
+    # `str` walks the expression too, so it is bounded on the same grounds --
+    # and overruns the recursion limit on the same expressions, which is why
+    # this guard stays broad.  It reports now instead of dropping silently.
     try:
         with _time_budget(limit):
             eq_str = str(simplified)
-    except Exception:
+    except Exception as exc:
+        _warn_convert_skipped(tokens, exc, limit)
         return None
     return eq_str, simplified
 
@@ -694,7 +736,7 @@ def _to_sympy(tokens: list[str]) -> tuple[str, Any] | None:
     try:
         with _time_budget(limit):
             expr = _rec()
-    except TimeoutError:
+    except (TimeoutError, RecursionError):
         return None
     if expr is None:
         return None
@@ -1036,7 +1078,14 @@ class NSREngine:
     batch_size:
         Number of expression trees sampled per iteration.
     max_len:
-        Maximum token sequence length (= maximum tree node count).
+        Maximum token sequence length (= maximum tree node count).  There is no
+        upper bound: a sequence too long to convert to sympy -- too slow to
+        build, or nested too deeply for the interpreter's recursion limit -- is
+        dropped from the front with a warning, not raised out of ``fit``
+        (the recursion half of that is new in 0.9.1).  The recursion limit is
+        left at the interpreter's default on purpose; raising it would trade a
+        catchable ``RecursionError`` for a C-stack overflow that no handler
+        sees.  A very large ``max_len`` therefore costs candidates, not runs.
     elite_frac:
         Epsilon of the risk-seeking policy gradient: each update uses only
         samples whose reward reaches the (1-epsilon) batch quantile, with the

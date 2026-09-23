@@ -520,6 +520,125 @@ def test_sympy_conversion_still_converts_benign_candidate(monkeypatch):
     assert "log" in eq_str
 
 
+def _deep_unary_tokens(depth: int, cycle: tuple[str, ...] = ("sqrt", "sign")) -> list[str]:
+    """A prefix sequence nesting ``depth`` unary ops over one feature.
+
+    The cycle alternates because sympy collapses a repeated idempotent op
+    (``Abs(Abs(x))`` is ``Abs(x)``), which would leave the tree shallow.
+    """
+    return [cycle[i % len(cycle)] for i in range(depth)] + ["p"]
+
+
+def _stack_depth() -> int:
+    import sys
+
+    depth, frame = 0, sys._getframe()
+    while frame is not None:
+        depth += 1
+        frame = frame.f_back
+    return depth
+
+
+def test_sympy_conversion_skips_a_candidate_too_deep_to_build(capsys):
+    """A candidate that overruns the recursion limit is skipped, not raised.
+
+    ``max_len`` has no documented ceiling, so a deeply nested candidate is
+    reachable through the public API.  Conversion recurses with the nesting
+    depth -- and so do sympy's own walks below it -- which ``_time_budget``
+    cannot bound: SIGALRM does not interrupt a stack overflow.  Before 0.9.1
+    the ``RecursionError`` escaped ``fit`` and lost the whole run.
+
+    The limit is pinned just above the current stack rather than the tokens
+    being made long enough to overrun the default, so the test does not depend
+    on how many frames the installed sympy spends per level.
+    """
+    import sys
+
+    import sympy  # noqa: F401  - imported here so the import is not what overruns
+
+    from nsr_engine import engine
+
+    tokens = _deep_unary_tokens(120)
+    original = sys.getrecursionlimit()
+    sys.setrecursionlimit(_stack_depth() + 80)
+    try:
+        converted = engine._to_sympy_affine(
+            tokens, 0.5, 1.2, _LOG_MEAN, _LOG_STD, feat_mode="log"
+        )
+    finally:
+        sys.setrecursionlimit(original)
+
+    assert converted is None, "a too-deep candidate must be skipped, not returned"
+    warning = capsys.readouterr().out
+    assert "skipped candidate" in warning
+    assert "recursion limit" in warning
+    assert "sqrt sign sqrt" in warning, "the dropped token sequence must be named"
+
+
+def test_sympy_conversion_survives_a_natural_deep_candidate():
+    """The same path at the default recursion limit, with no limit tampering.
+
+    500 nested ops is what ``max_len=500`` can sample.  Whether this version of
+    sympy converts it or runs out of stack is not the point -- ``fit`` must not
+    be the one that raises.
+    """
+    from nsr_engine import engine
+
+    converted = engine._to_sympy_affine(
+        _deep_unary_tokens(500), 0.5, 1.2, _LOG_MEAN, _LOG_STD, feat_mode="log"
+    )
+
+    assert converted is None or isinstance(converted, tuple)
+
+
+def test_bounded_simplify_returns_the_input_on_recursion(monkeypatch):
+    """``simplify`` walks the tree too, so it gets the timeout's treatment."""
+    import sympy as sp
+
+    from nsr_engine import engine
+
+    def _overrun(expr):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(sp, "simplify", _overrun)
+    expr = sp.Symbol("p") + sp.Float(1.0)
+
+    assert engine._bounded_simplify(expr) is expr
+
+
+def test_fit_returns_a_front_at_a_large_max_len(monkeypatch):
+    """The end-to-end contract: a big ``max_len`` costs candidates, not the run."""
+    from nsr_engine import engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "_CONVERT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(engine_mod, "_SIMPLIFY_TIMEOUT_S", 0.2)
+
+    rng = np.random.default_rng(0)
+    n = 200
+    X = pd.DataFrame(
+        {
+            "p": rng.uniform(1e-3, 0.9, n),
+            "l": rng.uniform(1e-3, 5.0, n),
+            "delta": 10 ** rng.uniform(-3.0, 3.0, n),
+        }
+    )
+    y = pd.Series(1.5 * np.log(X["delta"]) - X["p"] + 0.01 * rng.standard_normal(n))
+
+    front = NSREngine(
+        n_lambda=1,
+        n_iters=4,
+        batch_size=12,
+        max_len=70,
+        unary_ops=("square", "abs", "log", "exp", "sqrt", "tanh"),
+        scale_mode="log",
+        random_state=7,
+        boosting=False,
+        save_front=False,
+    ).fit(X, y)
+
+    assert isinstance(front, ParetoFront)
+
+
 def test_time_budget_runs_unbounded_when_disabled():
     """A non-positive limit means "no bound", and says so via the yielded flag."""
     from nsr_engine.engine import _time_budget

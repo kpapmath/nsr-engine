@@ -93,7 +93,7 @@ python main.py --no-save-front               # nowhere
 | `--lambda-max` | `1e-1` | Any positive float | Upper bound for the generated log-spaced lambda grid. |
 | `--iters`, `--n-iters` | `200` | Any positive integer | REINFORCE iterations per lambda. |
 | `--batch-size` | `64` | Any positive integer | Expressions sampled per iteration. |
-| `--max-len` | `15` | Any positive integer | Maximum prefix token sequence length (max expression node count). |
+| `--max-len` | `15` | Any positive integer | Maximum prefix token sequence length (max expression node count). No upper bound: a candidate too slow to convert to sympy, or nested too deeply for the interpreter's recursion limit, is dropped from the front with a warning rather than failing the run. |
 | `--elite-frac` | `0.05` | Float in `(0, 1]` | Risk-seeking elite quantile fraction. |
 | `--entropy-weight` | `0.005` | Any non-negative float | Entropy bonus weight. Higher values encourage exploration. |
 | `--hidden-dim` | `128` | Any positive integer | GRU hidden state size. |

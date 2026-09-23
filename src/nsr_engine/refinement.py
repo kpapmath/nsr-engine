@@ -107,7 +107,13 @@ def optimize_constants(
     except Exception:
         return expr
 
-    param_expr, consts = _parametrize(sexpr, sp)
+    try:
+        param_expr, consts = _parametrize(sexpr, sp)
+    except RecursionError:
+        # `_parametrize` rebuilds the tree recursively, so a deep enough
+        # expression exhausts the stack.  Returning the input unrefined is the
+        # fallback every other failure here already takes.  Since 0.9.1.
+        return expr
     # Guard rails: nothing to fit, or too many free parameters.
     if not consts or len(consts) > max_free_consts:
         return expr
